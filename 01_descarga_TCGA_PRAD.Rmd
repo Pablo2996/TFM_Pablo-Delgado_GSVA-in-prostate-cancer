@@ -1,0 +1,415 @@
+---
+title: "Descarga y Curación de Datos TCGA-PRAD"
+subtitle: "TFM — Integración de Transcriptómica Tumoral y Actividad Metabólica Inferida"
+author: "Jose Pablo Delgado Navarro"
+date: "14 de marzo de 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+    code_folding: none
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  cache     = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+```{r libraries, include=FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(knitr)
+library(kableExtra)
+
+col_primary <- "#2E75B6"
+col_accent  <- "#E8534A"
+
+dirs <- c("data/raw", "data/processed", "results/figures", "results/tables")
+invisible(lapply(dirs, dir.create, recursive = TRUE, showWarnings = FALSE))
+```
+
+---
+
+# Introducción
+
+## Contexto del trabajo
+
+Este documento forma parte del Trabajo de Fin de Máster en Bioinformática y Bioestadística (UOC). El objetivo general del TFM es desarrollar un modelo predictivo de la agresividad del cáncer de próstata a partir de datos transcriptómicos públicos, integrando la actividad de rutas metabólicas inferida mediante Gene Set Variation Analysis (GSVA).
+
+El cáncer de próstata es el tumor maligno más frecuente en hombres en los países occidentales. La heterogeneidad clínica de la enfermedad que va desde formas indolentes que no requieren tratamiento hasta formas agresivas con alto riesgo de metástasis, hace que la estratificación del riesgo sea un problema clínico de primer orden. El Gleason score, establecido por el patólogo a partir de la morfología tumoral, es actualmente el predictor pronóstico más robusto, pero su determinación es subjetiva e invasiva. Un modelo molecular que replique esta clasificación podría tener valor clínico como herramienta de apoyo diagnóstico.
+
+## Cohorte de estudio
+
+La cohorte utilizada es **TCGA-PRAD** (*The Cancer Genome Atlas — Prostate Adenocarcinoma*), una cohorte multicéntrica pública con datos moleculares y clínicos de pacientes con adenocarcinoma de próstata. Todos los datos son de acceso abierto y se descargan programáticamente desde el **Genomic Data Commons (GDC)** del National Cancer Institute (NCI) mediante el paquete TCGAbiolinks de Bioconductor (Colaprico *et al.*, 2016).
+
+## Objetivos de este script
+
+Este script implementa las fases de adquisición de datos, curación y control de calidad del pipeline y genera los siguientes outputs:
+
+| Archivo | Descripción |
+|---------|-------------|
+| `data/processed/se_final.rds` | SummarizedExperiment con la matriz de expresión génica filtrada |
+| `data/processed/clinical_final.rds` | Tabla clínica curada con el endpoint de agresividad tumoral |
+| `data/processed/clinical_final.csv` | Misma tabla en formato CSV para consulta externa |
+
+---
+
+# 1. Adquisición de datos RNA-seq {#rnaseq}
+
+```{r rnaseq-descarga, eval=FALSE, include=FALSE}
+query_rnaseq <- GDCquery(
+  project       = "TCGA-PRAD",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type   = c("Primary Tumor", "Solid Tissue Normal")
+)
+GDCdownload(query_rnaseq, method = "api", files.per.chunk = 10)
+se_prad <- GDCprepare(
+  query         = query_rnaseq,
+  save          = TRUE,
+  save.filename = "data/raw/TCGA_PRAD_RNAseq_SE.rda"
+)
+```
+
+```{r rnaseq-carga, include=FALSE}
+load("data/raw/TCGA_PRAD_RNAseq_SE.rda")
+stopifnot(exists("se_prad"), inherits(se_prad, "SummarizedExperiment"))
+```
+
+Los datos de expresión génica se obtuvieron del GDC utilizando el pipeline de cuantificación **STAR - Counts**, que proporciona conteos de lecturas por gen alineadas contra el genoma de referencia humano GRCh38. El objeto resultante contiene **`r nrow(se_prad)` genes** y **`r ncol(se_prad)` muestras**.
+
+```{r rnaseq-tabla}
+colData(se_prad) %>%
+  as.data.frame() %>%
+  count(sample_type, name = "N") %>%
+  rename("Tipo de tejido" = sample_type) %>%
+  kable(
+    caption = "**Tabla 1.** Distribución de muestras por tipo de tejido en la cohorte TCGA-PRAD.",
+    align   = c("l", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+La cohorte incluye tanto muestras de **tejido tumoral primario** como de **tejido normal adyacente**, lo que permite realizar comparaciones tumor-normal en análisis exploratorios. Para el modelado predictivo se utilizarán exclusivamente las muestras tumorales.
+
+---
+
+# 2. Datos clínicos {#clinical}
+
+```{r clinical-descarga, eval=FALSE, include=FALSE}
+clinical_raw <- GDCquery_clinic("TCGA-PRAD", type = "clinical")
+saveRDS(clinical_raw, "data/raw/TCGA_PRAD_clinical_GDC.rds")
+```
+
+```{r clinical-carga, include=FALSE}
+clinical_raw <- readRDS("data/raw/TCGA_PRAD_clinical_GDC.rds")
+```
+
+Los datos clínicos se descargaron mediante `GDCquery_clinic()`, que accede a los datos indexados del GDC en formato tabulado limpio. A diferencia de `GDCprepare_clinic()`, esta función evita problemas de concatenación errónea de campos numéricos compuestos (como el Gleason score) que se observaron al extraer los datos directamente del XML BCR.
+
+La tabla clínica contiene **`r nrow(clinical_raw)` pacientes** y **`r ncol(clinical_raw)` variables**, incluyendo datos de diagnóstico, estadio tumoral, tratamientos recibidos y variables moleculares derivadas de la publicación original de TCGA-PRAD (Cancer Genome Atlas Research Network, 2015).
+
+---
+
+# 3. Control de calidad {#qc}
+
+## 3.1 Calidad de la matriz de expresión génica
+
+```{r qc-rnaseq, fig.cap="**Figura 1.** Distribución de conteos totales por muestra en escala log10. Una distribución homogénea entre muestras indica ausencia de problemas técnicos en la secuenciación."}
+set.seed(1229)
+n_na <- sum(is.na(assay(se_prad, "unstranded")))
+
+colSums(assay(se_prad, "unstranded")) %>%
+  data.frame(total_counts = ., tipo = colData(se_prad)$sample_type) %>%
+  ggplot(aes(x = log10(total_counts), fill = tipo)) +
+  geom_histogram(bins = 40, alpha = 0.8, color = "white") +
+  scale_fill_manual(values = c(
+    "Primary Tumor"       = col_primary,
+    "Solid Tissue Normal" = col_accent
+  )) +
+  labs(
+    title = "Distribución de conteos totales — TCGA-PRAD",
+    x     = "log10(Total de conteos por muestra)",
+    y     = "Número de muestras",
+    fill  = "Tipo de tejido"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+La matriz de expresión no presenta valores faltantes (NA = `r n_na`). La distribución de conteos totales es homogénea entre muestras dentro de cada tipo de tejido, lo que indica una buena calidad técnica del experimento de secuenciación. No se identifican muestras con conteos anómalamente bajos que justifiquen su exclusión en esta fase; este análisis se completará en la etapa de preprocesado.
+
+## 3.2 Calidad de los datos clínicos
+
+```{r qc-clinical}
+variables_interes <- c(
+  "submitter_id", "primary_gleason_grade", "secondary_gleason_grade",
+  "gleason_score", "ajcc_pathologic_t", "age_at_index", "vital_status"
+)
+
+missings_tbl <- clinical_raw %>%
+  select(all_of(variables_interes)) %>%
+  summarise(across(everything(),
+    list(Nfalt = ~sum(is.na(.)), Pctfalt = ~round(mean(is.na(.)) * 100, 1))
+  )) %>%
+  pivot_longer(everything(),
+    names_to      = c("Variable", ".value"),
+    names_pattern = "^(.+)_(Nfalt|Pctfalt)$"
+  )
+
+filas_con_na <- which(missings_tbl$Nfalt > 0)
+
+missings_tbl %>%
+  kable(
+    caption   = "**Tabla 2.** Valores faltantes en las variables clínicas de interés.",
+    col.names = c("Variable", "N faltantes", "% faltantes"),
+    align     = c("l", "r", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(filas_con_na, background = "#FEF9E7")
+```
+
+El Gleason score y sus componentes (grado primario y secundario) están **completos para los 500 pacientes**, lo que garantiza la definición del endpoint sin pérdida de casos. La variable `ajcc_pathologic_t` presenta un 1.4% de valores faltantes (7 pacientes), que serán excluidos del análisis al no disponer de información sobre la extensión tumoral local. La variable `ajcc_pathologic_stage` (estadio patológico AJCC) está completamente ausente en los datos indexados del GDC para esta cohorte y no será utilizada como variable predictora.
+
+## 3.3 Correspondencia de identificadores entre fuentes
+
+```{r qc-barcodes}
+tumor_barcodes <- colData(se_prad) %>%
+  as.data.frame() %>%
+  filter(sample_type == "Primary Tumor") %>%
+  pull(bcr_patient_barcode) %>%
+  substr(1, 12) %>%
+  unique()
+
+clinical_barcodes <- clinical_raw$submitter_id
+solapamiento <- length(intersect(tumor_barcodes, clinical_barcodes))
+
+data.frame(
+  Metrica = c(
+    "Muestras tumorales en RNA-seq",
+    "Pacientes en datos clínicos",
+    "Solapamiento — usables en el TFM",
+    "Solo en RNA-seq (sin clínica)",
+    "Solo en clínica (sin RNA-seq)"
+  ),
+  N = c(
+    length(tumor_barcodes),
+    length(clinical_barcodes),
+    solapamiento,
+    length(setdiff(tumor_barcodes, clinical_barcodes)),
+    length(setdiff(clinical_barcodes, tumor_barcodes))
+  )
+) %>%
+  kable(
+    caption = "**Tabla 3.** Correspondencia de identificadores de paciente entre fuentes de datos.",
+    align   = c("l", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  row_spec(3, bold = TRUE, background = "#EBF5FB")
+```
+
+Se identificaron **`r solapamiento` pacientes** con datos disponibles en ambas fuentes de datos. Los identificadores de paciente en el objeto RNA-seq siguen el formato extendido TCGA (16 caracteres, incluyendo el sufijo de muestra), mientras que los identificadores clínicos usan el formato estándar de paciente (12 caracteres). La concordancia se estableció mediante truncado a los 12 primeros caracteres del barcode.
+
+---
+
+# 4. Definición del endpoint de agresividad tumoral {#endpoint}
+
+## 4.1 Criterios de clasificación
+
+El endpoint del modelo predictivo es la **agresividad tumoral**, definida a partir del **Gleason score** según los criterios de estratificación de riesgo de D'Amico *et al.* (1998) y las recomendaciones del grupo de consenso ISUP (Epstein *et al.*, 2016). El Gleason score se obtiene sumando el grado histológico del patrón celular más frecuente (grado primario) y el segundo más frecuente (grado secundario) en la biopsia tumoral.
+
+| Grupo de agresividad | Gleason score | Interpretación clínica |
+|---------------------|--------------|------------------------|
+| **Baja** | ≤ 6 | Tumor bien diferenciado; bajo riesgo de progresión |
+| **Intermedia** | 7 | Tumor moderadamente diferenciado; riesgo intermedio |
+| **Alta** | ≥ 8 | Tumor pobremente diferenciado; alto riesgo de metástasis |
+
+## 4.2 Distribución del endpoint en la cohorte
+
+```{r endpoint, echo=TRUE}
+clinical_curated <- clinical_raw %>%
+  rename(
+    gleason_primary   = primary_gleason_grade,
+    gleason_secondary = secondary_gleason_grade,
+    gleason_total     = gleason_score,
+    t_stage           = ajcc_pathologic_t,
+    age               = age_at_index
+  ) %>%
+  select(-submitter_id) %>%
+  filter(bcr_patient_barcode %in% tumor_barcodes) %>%
+  mutate(
+    gleason_total = as.numeric(gleason_total),
+    agresividad = case_when(
+      gleason_total <= 6 ~ "Baja",
+      gleason_total == 7 ~ "Intermedia",
+      gleason_total >= 8 ~ "Alta",
+      TRUE               ~ NA_character_
+    ),
+    agresividad = factor(agresividad,
+                         levels  = c("Baja", "Intermedia", "Alta"),
+                         ordered = TRUE),
+    t_stage_simple = str_extract(t_stage, "T[1-4]")
+  )
+```
+
+```{r endpoint-plot, fig.cap="**Figura 2.** Distribución del endpoint de agresividad tumoral en la cohorte TCGA-PRAD."}
+clinical_curated %>%
+  filter(!is.na(agresividad)) %>%
+  count(agresividad) %>%
+  ggplot(aes(x = agresividad, y = n, fill = agresividad)) +
+  geom_col(color = "white", width = 0.6) +
+  geom_text(aes(label = n), vjust = -0.5, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c(
+    "Baja"       = "#5DADE2",
+    "Intermedia" = "#F39C12",
+    "Alta"       = col_accent
+  )) +
+  labs(
+    title    = "Endpoint: Agresividad tumoral — TCGA-PRAD",
+    subtitle = "Clasificación basada en Gleason score (D'Amico 1998; Epstein 2016)",
+    x        = "Grupo de agresividad",
+    y        = "Número de pacientes"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+> La clase intermedia (Gleason = 7) es la más frecuente, seguida de la clase alta (Gleason ≥ 8). Este desequilibrio entre clases deberá tenerse en cuenta al diseñar el esquema de validación cruzada estratificada en la fase de modelado.
+
+De los `r nrow(clinical_curated)` pacientes con muestra tumoral, **`r sum(!is.na(clinical_curated$agresividad))`** tienen Gleason score registrado y forman el conjunto analizable. La distribución no es uniforme, la clase Baja (Gleason ≤6) representa solo el `r round(sum(clinical_curated$agresividad == "Baja", na.rm=TRUE) / sum(!is.na(clinical_curated$agresividad)) * 100, 1)`% de la cohorte (n = `r sum(clinical_curated$agresividad == "Baja", na.rm=TRUE)`), mientras que Intermedia y Alta acaparan el resto. Esto no es un defecto del dataset —refleja la realidad de TCGA-PRAD, que sobrerepresenta pacientes sometidos a prostatectomía radical, un procedimiento que se indica principalmente en tumores de riesgo intermedio y alto. El desequilibrio tendrá consecuencias directas en el modelado; justifica el uso de validación cruzada estratificada y complica la discriminación de la clase minoritaria, como se verá en el Script 04.
+
+---
+
+# 5. Construcción del dataset integrado {#integration}
+
+```{r integration}
+barcodes_finales <- clinical_curated %>%
+  filter(!is.na(agresividad)) %>%
+  pull(bcr_patient_barcode)
+
+idx <- substr(colData(se_prad)$bcr_patient_barcode, 1, 12) %in% barcodes_finales &
+       colData(se_prad)$sample_type == "Primary Tumor"
+
+se_final <- se_prad[, idx]
+barcodes_se_truncados <- substr(colData(se_final)$bcr_patient_barcode, 1, 12)
+se_final <- se_final[, !duplicated(barcodes_se_truncados)]
+barcodes_se_truncados <- substr(colData(se_final)$bcr_patient_barcode, 1, 12)
+
+# Extraer PSA preoperatorio desde colData del SE (paper_PSA_preop viene del paper original de TCGA-PRAD)
+psa_df <- colData(se_final) %>%
+  as.data.frame() %>%
+  mutate(bcr_patient_barcode = substr(bcr_patient_barcode, 1, 12)) %>%
+  dplyr::select(bcr_patient_barcode, paper_PSA_preop) %>%
+  distinct(bcr_patient_barcode, .keep_all = TRUE)
+
+# Alinear tabla clinica al mismo orden que el SE
+clinical_final <- clinical_curated %>%
+  filter(bcr_patient_barcode %in% barcodes_se_truncados) %>%
+  arrange(match(bcr_patient_barcode, barcodes_se_truncados)) %>%
+  left_join(psa_df, by = "bcr_patient_barcode")
+
+stopifnot(
+  length(clinical_final$bcr_patient_barcode) == length(barcodes_se_truncados),
+  all(clinical_final$bcr_patient_barcode == barcodes_se_truncados)
+)
+
+cat("=== Dataset integrado final ===\n")
+cat("  Genes:   ", nrow(se_final), "\n")
+cat("  Muestras:", ncol(se_final), "\n")
+cat("  PSA disponible:", sum(!is.na(clinical_final$paper_PSA_preop)),
+    "de", nrow(clinical_final), "pacientes\n\n")
+cat("Distribucion del endpoint:\n")
+print(table(clinical_final$agresividad))
+```
+
+```{r integration-tabla}
+table(clinical_final$agresividad) %>%
+  as.data.frame() %>%
+  rename("Grupo de agresividad" = Var1, N = Freq) %>%
+  mutate(Porcentaje = paste0(round(N / sum(N) * 100, 1), "%")) %>%
+  kable(
+    caption = "**Tabla 4.** Distribución del endpoint en el dataset integrado final.",
+    align   = c("l", "r", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+El dataset integrado final contiene **`r ncol(se_final)` muestras tumorales** con expresión de **`r nrow(se_final)` genes**, alineadas con su correspondiente información clínica. La alineación entre la matriz de expresión y la tabla clínica se verificó explícitamente mediante concordancia exacta de identificadores en el mismo orden, garantizando la integridad del dataset para las fases posteriores del pipeline.
+
+```{r save, echo=TRUE}
+saveRDS(se_final,       "data/processed/se_final.rds")
+saveRDS(clinical_final, "data/processed/clinical_final.rds")
+write_csv(clinical_final, "data/processed/clinical_final.csv")
+```
+
+---
+
+# 6. Resumen ejecutivo {#resumen}
+
+```{r resumen-tabla}
+data.frame(
+  Parametro = c(
+    "Cohorte", "Fuente de datos",
+    "Muestras RNA-seq totales", "Muestras tumorales (Primary Tumor)",
+    "Muestras tejido normal (Solid Tissue Normal)",
+    "Genes en la matriz de expresion",
+    "Pacientes con datos clinicos",
+    "Pacientes en dataset final (con endpoint)",
+    "Endpoint — Baja agresividad (Gleason <= 6)",
+    "Endpoint — Agresividad intermedia (Gleason = 7)",
+    "Endpoint — Alta agresividad (Gleason >= 8)",
+    "Pacientes excluidos (Gleason faltante)",
+    "Fecha de procesado", "Siguiente script"
+  ),
+  Valor = c(
+    "TCGA-PRAD", "GDC — NCI (acceso abierto)",
+    as.character(ncol(se_prad)),
+    as.character(sum(colData(se_prad)$sample_type == "Primary Tumor")),
+    as.character(sum(colData(se_prad)$sample_type == "Solid Tissue Normal")),
+    as.character(nrow(se_prad)),
+    as.character(nrow(clinical_raw)),
+    as.character(ncol(se_final)),
+    as.character(sum(clinical_final$agresividad == "Baja")),
+    as.character(sum(clinical_final$agresividad == "Intermedia")),
+    as.character(sum(clinical_final$agresividad == "Alta")),
+    as.character(sum(is.na(clinical_curated$agresividad))),
+    format(Sys.Date(), "2026-03-14"),
+    "02_preprocesado.Rmd"
+  )
+) %>%
+  kable(
+    caption = "**Tabla 5.** Resumen del proceso de adquisición y curación de datos.",
+    col.names = c("Parámetro", "Valor"),
+    align = c("l", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(c(8,9,10,11), background = "#EBF5FB")
+```
+
+```{r session-info}
+sessionInfo()
+```

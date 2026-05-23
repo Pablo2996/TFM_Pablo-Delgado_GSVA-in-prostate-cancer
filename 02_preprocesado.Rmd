@@ -1,0 +1,437 @@
+---
+title: "Preprocesado Transcriptómico — TCGA-PRAD"
+subtitle: "TFM — Integración de Transcriptómica Tumoral y Actividad Metabólica Inferida"
+author: "Jose Pablo Delgado Navarro"
+date: "20 de marzo de 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+    code_folding: none
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  cache     = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+```{r libraries, include=FALSE}
+library(SummarizedExperiment)
+library(DESeq2)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(gridExtra)
+library(readr)
+library(knitr)
+library(kableExtra)
+
+col_primary    <- "#2E75B6"
+col_accent     <- "#E8534A"
+col_intermedio <- "#F39C12"
+```
+
+---
+
+# Introducción
+
+Este script implementa la fase de **preprocesado transcriptómico** del pipeline del TFM. Parte de los objetos generados en el script anterior (`se_final.rds` y `clinical_final.rds`) y produce una **matriz de expresión normalizada** lista para la inferencia de actividad metabólica mediante GSVA.
+
+El preprocesado de datos RNA-seq comprende tres etapas secuenciales:
+
+1. **Filtrado de genes de baja expresión** — eliminar genes con conteos insuficientes para ser informativos, reduciendo el ruido estadístico y el coste computacional de los pasos siguientes.
+2. **Normalización VST** — transformación de varianza estabilizada para hacer los datos comparables entre muestras y adecuados para análisis multivariantes.
+3. **Análisis exploratorio (PCA)** — verificar la estructura de los datos normalizados, detectar outliers y evaluar si el endpoint de agresividad genera separación en el espacio de componentes principales.
+
+**Outputs de este script:**
+
+| Archivo | Descripción |
+|---------|-------------|
+| `data/processed/vst_matrix.rds` | Matriz de expresión normalizada (VST), genes × muestras |
+| `data/processed/se_filtered.rds` | SummarizedExperiment tras el filtrado de genes |
+
+---
+
+# 1. Carga de datos {#carga}
+
+```{r carga, include=FALSE}
+se_final       <- readRDS("data/processed/se_final.rds")
+clinical_final <- readRDS("data/processed/clinical_final.rds")
+
+stopifnot(
+  inherits(se_final, "SummarizedExperiment"),
+  nrow(clinical_final) == ncol(se_final),
+  all(substr(colData(se_final)$bcr_patient_barcode, 1, 12) ==
+      clinical_final$bcr_patient_barcode)
+)
+```
+
+Se cargaron los datos producidos por el script 01. El dataset contiene **`r nrow(se_final)` genes** y **`r ncol(se_final)` muestras tumorales**, con la tabla clínica alineada en el mismo orden.
+
+```{r carga-resumen}
+data.frame(
+  Parametro = c("Genes en la matriz cruda",
+                "Muestras tumorales",
+                "Pacientes con endpoint definido"),
+  Valor = c(nrow(se_final), ncol(se_final), nrow(clinical_final))
+) %>%
+  kable(caption = "**Tabla 1.** Dimensiones del dataset al inicio del preprocesado.",
+        align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# 2. Filtrado de genes de baja expresión {#filtrado}
+
+## 2.1 Criterio de filtrado
+
+Los datos RNA-seq crudos contienen genes con conteos muy bajos o nulos en la mayoría de muestras que no aportan información biológica útil pero incrementan el ruido estadístico y el coste computacional. Se aplica el criterio descrito por Chen, Lun y Smyth (2016): **al menos 10 conteos en al menos el 20% de las muestras**.
+
+```{r filtrado, echo=TRUE}
+counts_raw   <- assay(se_final, "unstranded")
+min_conteos  <- 10
+min_muestras <- round(ncol(counts_raw) * 0.20)
+genes_ok     <- rowSums(counts_raw >= min_conteos) >= min_muestras
+se_filtered  <- se_final[genes_ok, ]
+```
+
+```{r filtrado-resumen}
+data.frame(
+  Parametro = c("Genes antes del filtrado",
+                "Genes tras el filtrado",
+                "Genes eliminados",
+                "Porcentaje mantenido"),
+  Valor = c(nrow(se_final),
+            nrow(se_filtered),
+            sum(!genes_ok),
+            paste0(round(mean(genes_ok) * 100, 1), "%"))
+) %>%
+  kable(caption = "**Tabla 2.** Resultado del filtrado de genes de baja expresión.",
+        align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 2.2 Distribución de conteos por gen
+
+```{r filtrado-plot, fig.cap="**Figura 1.** Distribución de la suma de conteos por gen (escala log10). En gris, los genes eliminados por el filtro de baja expresión; en azul, los genes mantenidos para el análisis. La barra en x = 0 corresponde a genes con conteos nulos o casi nulos en toda la cohorte, lo cual es esperado en datos de RNA-seq de tejido tumoral."}
+data.frame(total_gene = rowSums(counts_raw), mantenidos = genes_ok) %>%
+  ggplot(aes(x = log10(total_gene + 1), fill = mantenidos)) +
+  geom_histogram(bins = 60, alpha = 0.8, color = "white") +
+  scale_fill_manual(values = c("TRUE" = col_primary, "FALSE" = "#CCCCCC"),
+                    labels = c("TRUE" = "Mantenidos", "FALSE" = "Eliminado")) +
+  labs(title = "Distribución de conteos totales por gen — TCGA-PRAD",
+       x = "log10(Suma de conteos + 1)", y = "Número de genes", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+Tras el filtrado se retienen **`r nrow(se_filtered)`** de los `r nrow(se_final)` genes originales (`r round(mean(genes_ok)*100,1)`%). Los `r sum(!genes_ok)` genes eliminados presentaban conteos insuficientes para ser considerados expresados de forma confiable en esta cohorte.
+
+---
+
+# 3. Normalización VST {#normalizacion}
+
+## 3.1 Fundamento
+
+Los conteos crudos de RNA-seq presentan varianza heterocedástica — los genes con alta expresión muestran mayor varianza absoluta — y no son directamente comparables entre muestras con distinta profundidad de secuenciación. La **Transformación de Varianza Estabilizada** (VST) implementada en DESeq2 (Love, Huber y Anders, 2014) corrige ambos problemas simultáneamente, produciendo valores en escala logarítmica aproximada con varianza homogénea en todo el rango de expresión. Se utiliza el parámetro `blind = TRUE`, que recalcula las dispersiones sin utilizar información sobre los grupos experimentales, lo cual es el procedimiento recomendado para análisis de control de calidad y exploratorios.
+
+## 3.2 Aplicación
+
+```{r vst, echo=TRUE}
+dds        <- DESeqDataSet(se_filtered, design = ~1)
+vst_obj    <- vst(dds, blind = TRUE)
+vst_matrix <- assay(vst_obj)
+```
+
+La matriz VST resultante contiene **`r nrow(vst_matrix)` genes** y **`r ncol(vst_matrix)` muestras**, con valores en el rango `r round(min(vst_matrix),2)`–`r round(max(vst_matrix),2)`.
+
+## 3.3 Verificación de la normalización
+
+```{r vst-verificacion, fig.cap="**Figura 2.** Distribución de expresión por muestra antes (izquierda) y después (derecha) de la normalización VST, sobre una selección aleatoria de 50 muestras. El patrón bimodal refleja dos poblaciones de genes: los de expresión baja (pico izquierdo) y los de expresión moderada a alta (pico derecho). Tras la VST, las curvas de las 50 muestras se superponen con mayor fidelidad, lo que indica que las diferencias técnicas de profundidad de secuenciación han sido corregidas."}
+set.seed(1229)
+muestras_idx  <- sample(ncol(counts_raw), min(50, ncol(counts_raw)))
+counts_subset <- counts_raw[genes_ok, muestras_idx]
+log2_counts   <- log2(counts_subset + 1)
+
+antes <- log2_counts %>%
+  as.data.frame() %>%
+  tidyr::pivot_longer(everything(), names_to = "muestra", values_to = "expresion") %>%
+  mutate(fase = "Antes (log2 conteos + 1)")
+
+despues <- vst_matrix[, muestras_idx] %>%
+  as.data.frame() %>%
+  tidyr::pivot_longer(everything(), names_to = "muestra", values_to = "expresion") %>%
+  mutate(fase = "Despues (VST)")
+
+rbind(antes, despues) %>%
+  mutate(fase = factor(fase, levels = c("Antes (log2 conteos + 1)", "Despues (VST)"))) %>%
+  ggplot(aes(x = expresion, color = muestra)) +
+  geom_density(alpha = 0.3, show.legend = FALSE, linewidth = 0.3) +
+  facet_wrap(~fase, scales = "free_x") +
+  labs(title = "Distribución de expresión antes y después de la normalización VST",
+       x = "Valor de expresión", y = "Densidad") +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+La normalización VST fue exitosa. Las distribuciones de las 50 muestras son sustancialmente más homogéneas tras la transformación, lo que confirma que el sesgo técnico de profundidad de secuenciación ha sido corregido. La estructura bimodal se conserva en ambos paneles, lo cual es esperado: la VST no altera la biología subyacente, únicamente estabiliza la varianza técnica.
+
+---
+
+# 4. Análisis de Componentes Principales (PCA) {#pca}
+
+## 4.1 Fundamento
+
+El PCA proyecta los datos de alta dimensión en un espacio reducido de componentes principales que capturan la mayor parte de la varianza. En el contexto de este TFM, el PCA permite detectar outliers, identificar posibles efectos batch y evaluar si el endpoint de agresividad genera separación biológica en los datos transcriptómicos. Se utilizan los **500 genes con mayor varianza** entre muestras, criterio estándar en análisis exploratorios de RNA-seq.
+
+## 4.2 Cálculo
+
+```{r pca, echo=TRUE}
+set.seed(1229)
+var_genes <- apply(vst_matrix, 1, var)
+top_genes <- order(var_genes, decreasing = TRUE)[1:500]
+pca_res   <- prcomp(t(vst_matrix[top_genes, ]), scale. = FALSE)
+var_exp   <- round(summary(pca_res)$importance[2, 1:10] * 100, 1)
+
+# Variables tecnicas extraidas del barcode TCGA
+# Caracteres 6-7:   Tissue Source Site (TSS) — centro hospitalario de origen
+# Caracteres 22-25: Plate ID — placa de procesamiento en laboratorio
+barcodes_full <- colData(se_filtered)$bcr_patient_barcode
+
+pca_df <- data.frame(
+  PC1         = pca_res$x[, 1],
+  PC2         = pca_res$x[, 2],
+  PC3         = pca_res$x[, 3],
+  agresividad = clinical_final$agresividad,
+  gleason     = clinical_final$gleason_total,
+  t_stage     = clinical_final$t_stage_simple,
+  barcode     = clinical_final$bcr_patient_barcode,
+  tss         = substr(barcodes_full, 6, 7),
+  plate       = substr(barcodes_full, 22, 25)
+)
+```
+
+## 4.3 PCA coloreado por variables técnicas
+
+El PCA coloreado por agresividad evalúa la señal biológica de interés. Sin embargo, es igualmente importante verificar que la estructura del PCA no esté dominada por **variables técnicas** como el centro de origen de la muestra (Tissue Source Site, TSS) o la placa de procesamiento en laboratorio. Si las muestras se agrupan principalmente por estas variables se indicaría un efecto batch que podría sesgar el análisis downstream.
+
+Los identificadores TCGA codifican esta información directamente en el barcode; los caracteres 6–7 corresponden al TSS y los caracteres 22–25 al Plate ID.
+
+```{r pca-tecnico, echo=FALSE, fig.width=10, fig.height=5, fig.cap="**Figura 3.** PCA coloreado por variables técnicas. *Izquierda:* Tissue Source Site (TSS), centro hospitalario de origen. *Derecha:* Plate ID, placa de procesamiento. La ausencia de agrupación sistemática por estas variables confirma que la estructura del PCA refleja variabilidad biológica y no efectos técnicos de batch."}
+
+p_tss <- ggplot(pca_df, aes(x = PC1, y = PC2, color = tss)) +
+  geom_point(alpha = 0.65, size = 2) +
+  labs(
+    title    = "PCA coloreado por TSS",
+    subtitle = "Tissue Source Site (centro de origen)",
+    x        = paste0("PC1 (", var_exp[1], "%)"),
+    y        = paste0("PC2 (", var_exp[2], "%)"),
+    color    = "TSS"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position  = "right",
+        legend.text      = element_text(size = 8),
+        legend.key.size  = unit(0.4, "cm"))
+
+p_plate <- ggplot(pca_df, aes(x = PC1, y = PC2, color = plate)) +
+  geom_point(alpha = 0.65, size = 2) +
+  labs(
+    title    = "PCA coloreado por Plate ID",
+    subtitle = "Placa de procesamiento en laboratorio",
+    x        = paste0("PC1 (", var_exp[1], "%)"),
+    y        = paste0("PC2 (", var_exp[2], "%)"),
+    color    = "Plate"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position  = "right",
+        legend.text      = element_text(size = 7),
+        legend.key.size  = unit(0.4, "cm"))
+
+grid.arrange(p_tss, p_plate, ncol = 2)
+```
+
+Los `r length(unique(pca_df$tss))` centros de origen (TSS) se distribuyen homogéneamente en el espacio PC1–PC2 sin formar agrupaciones compactas. El Plate ID es uniforme en toda la cohorte (todas las muestras comparten el mismo identificador de placa) lo que indica procesamiento estandarizado en laboratorio. En conjunto, no hay evidencia de efectos batch técnicos que justifiquen corrección adicional. La VST fue suficiente.
+
+## 4.4 PCA coloreado por agresividad tumoral
+
+```{r pca-plot, fig.cap="**Figura 4.** PCA de la matriz de expresión normalizada (VST). Cada punto representa una muestra tumoral, coloreada según el grupo de agresividad. La ausencia de separación nítida entre grupos en el espacio PC1–PC2 es esperada: PC1 y PC2 capturan principalmente variabilidad biológica general (heterogeneidad tumoral, pureza celular) no directamente ligada al Gleason score. La señal discriminante relevante para el modelo predictivo se explorará en el espacio de rutas metabólicas mediante GSVA."}
+ggplot(pca_df, aes(x = PC1, y = PC2, color = agresividad)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  scale_color_manual(values = c("Baja" = "#5DADE2",
+                                "Intermedia" = col_intermedio,
+                                "Alta" = col_accent)) +
+  labs(title    = "PCA — Matriz de expresión normalizada (VST)",
+       subtitle = paste0("PC1: ", var_exp[1], "% | PC2: ", var_exp[2],
+                         "% de varianza explicada"),
+       x = paste0("PC1 (", var_exp[1], "%)"),
+       y = paste0("PC2 (", var_exp[2], "%)"),
+       color = "Agresividad") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+PC1 (`r var_exp[1]`%) y PC2 (`r var_exp[2]`%) capturan conjuntamente el `r var_exp[1] + var_exp[2]`% de la varianza total, reflejando principalmente fuentes de variación biológica global(heterogeneidad tumoral, pureza celular, variación estromal) no directamente ligadas al Gleason score. Que los grupos de agresividad no se separen aquí no es un problema; el PCA sobre genes individuales no es el espacio donde se espera encontrar esa señal. El espacio de rutas metabólicas GSVA, con dimensionalidad reducida y variables biológicamente más estables, es donde se buscará esa separación en el Script 03.
+
+## 4.5 Varianza explicada por componente
+
+```{r pca-scree, fig.cap="**Figura 5.** Gráfico de sedimentación (scree plot) de las primeras 10 componentes principales. La varianza explicada decrece progresivamente sin un codo pronunciado, lo que indica que la variabilidad biológica de esta cohorte está distribuida en múltiples dimensiones y no existe un único eje dominante. Este patrón es característico de datos transcriptómicos tumorales heterogéneos."}
+data.frame(PC = paste0("PC", 1:10), varianza = var_exp) %>%
+  mutate(PC = factor(PC, levels = PC)) %>%
+  ggplot(aes(x = PC, y = varianza)) +
+  geom_col(fill = col_primary, alpha = 0.8, width = 0.6) +
+  geom_text(aes(label = paste0(varianza, "%")), vjust = -0.4, size = 3.5) +
+  labs(title = "Varianza explicada por componente principal",
+       x = "Componente principal", y = "Varianza explicada (%)") +
+  theme_minimal(base_size = 12)
+```
+
+## 4.6 Detección de outliers
+
+```{r outliers, echo=TRUE}
+coords   <- pca_df[, c("PC1", "PC2")]
+dist_mah <- mahalanobis(coords, colMeans(coords), cov(coords))
+pca_df$outlier <- dist_mah > qchisq(0.999, df = 2)
+n_outliers <- sum(pca_df$outlier)
+cat("Muestras identificadas como outlier:", n_outliers, "\n")
+if (n_outliers > 0) print(pca_df$barcode[pca_df$outlier])
+```
+
+```{r outliers-plot, fig.cap="**Figura 6.** PCA con muestras outlier resaltadas (distancia de Mahalanobis, p < 0.001). Las muestras marcadas en rojo presentan un perfil de expresión estadísticamente alejado del centroide de la cohorte y son excluidas del análisis posterior."}
+ggplot(pca_df, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = outlier), alpha = 0.7, size = 2.5) +
+  scale_color_manual(values = c("FALSE" = col_primary, "TRUE" = col_accent),
+                     labels = c("FALSE" = "Normal", "TRUE" = "Outlier")) +
+  geom_label_repel(data = filter(pca_df, outlier), aes(label = barcode),
+                   size = 2.8, max.overlaps = 20, box.padding = 0.4) +
+  labs(title    = "Detección de outliers — distancia de Mahalanobis (PCA)",
+       subtitle = paste0(n_outliers, " muestras identificadas como outlier (p < 0.001)"),
+       x = paste0("PC1 (", var_exp[1], "%)"),
+       y = paste0("PC2 (", var_exp[2], "%)"),
+       color = NULL) +
+  theme_minimal(base_size = 12)
+```
+
+```{r outliers-exclusion, echo=TRUE}
+if (n_outliers > 0) {
+  barcodes_outlier <- pca_df$barcode[pca_df$outlier]
+  idx_ok           <- !clinical_final$bcr_patient_barcode %in% barcodes_outlier
+  clinical_final   <- clinical_final[idx_ok, ]
+  vst_matrix       <- vst_matrix[, idx_ok]
+  se_filtered      <- se_filtered[, idx_ok]
+  cat("Muestras tras exclusion de outliers:", ncol(vst_matrix), "\n")
+} else {
+  cat("No se identificaron outliers. Dataset sin cambios.\n")
+}
+```
+
+`r if(n_outliers == 0) "No se identificó ninguna muestra atípica. El dataset entra en la fase de GSVA con las mismas" else paste(n_outliers, "muestras fueron excluidas.")` `r ncol(vst_matrix)` muestras y `r nrow(vst_matrix)` genes.
+
+---
+
+# 5. Verificación final {#verificacion}
+
+```{r verificacion}
+stopifnot(
+  ncol(vst_matrix) == nrow(clinical_final),
+  all(substr(colnames(vst_matrix), 1, 16) ==
+      colData(se_filtered)$bcr_patient_barcode)
+)
+
+data.frame(
+  Parametro = c("Genes antes del filtrado",
+                "Genes tras filtrado",
+                "Muestras antes de excluir outliers",
+                "Outliers detectados y excluidos",
+                "Muestras en dataset final",
+                "Rango de valores VST"),
+  Valor = c(nrow(se_final), nrow(se_filtered), nrow(pca_df),
+            n_outliers, ncol(vst_matrix),
+            paste0(round(min(vst_matrix), 2), " — ",
+                   round(max(vst_matrix), 2)))
+) %>%
+  kable(caption = "**Tabla 3.** Resumen del preprocesado transcriptómico.",
+        align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# 6. Guardar outputs {#guardar}
+
+```{r save, echo=TRUE}
+colnames(vst_matrix) <- substr(colnames(vst_matrix), 1, 16)
+
+saveRDS(vst_matrix,     "data/processed/vst_matrix.rds")
+saveRDS(se_filtered,    "data/processed/se_filtered.rds")
+saveRDS(clinical_final, "data/processed/clinical_final.rds")
+write_csv(clinical_final, "data/processed/clinical_final.csv")
+```
+
+---
+
+# 7. Resumen ejecutivo {#resumen}
+
+```{r resumen}
+data.frame(
+  Parametro = c(
+    "Genes en matriz cruda",
+    "Criterio de filtrado",
+    "Genes mantenidos tras filtrado",
+    "Metodo de normalizacion",
+    "Outliers detectados",
+    "Muestras en dataset final",
+    "Endpoint — Baja agresividad",
+    "Endpoint — Agresividad intermedia",
+    "Endpoint — Alta agresividad",
+    "Fecha de procesado",
+    "Siguiente script"
+  ),
+  Valor = c(
+    as.character(nrow(se_final)),
+    paste0(">= 10 conteos en >= 20% muestras (n >= ", min_muestras, ")"),
+    paste0(nrow(se_filtered), " (", round(mean(genes_ok)*100,1), "%)"),
+    "VST, DESeq2 (Love, Huber y Anders, 2014)",
+    as.character(n_outliers),
+    as.character(ncol(vst_matrix)),
+    as.character(sum(clinical_final$agresividad == "Baja")),
+    as.character(sum(clinical_final$agresividad == "Intermedia")),
+    as.character(sum(clinical_final$agresividad == "Alta")),
+    "2026-03-20",
+    "03_gsva.Rmd"
+  )
+) %>%
+  kable(caption = "**Tabla 4.** Resumen del preprocesado transcriptómico.",
+        col.names = c("Parámetro", "Valor"), align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(6:9, background = "#EBF5FB")
+```
+
+---
+
+# Referencias
+
+Chen, Y., Lun, A.T.L. y Smyth, G.K. (2016) 'From reads to genes to pathways: differential expression analysis of RNA-Seq experiments using Rsubread and the edgeR quasi-likelihood pipeline', *F1000Research*, 5, p. 1438. doi: 10.12688/f1000research.8987.2.
+
+Love, M.I., Huber, W. y Anders, S. (2014) 'Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2', *Genome Biology*, 15(12), p. 550. doi: 10.1186/s13059-014-0550-8.
+
+```{r session-info}
+sessionInfo()
+```

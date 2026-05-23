@@ -1,0 +1,745 @@
+---
+title: "Modelado Predictivo de Agresividad Tumoral — TCGA-PRAD"
+subtitle: "TFM — Integración de Transcriptómica Tumoral y Actividad Metabólica Inferida (Incluyendo variable ganglionar)"
+author: "Jose Pablo Delgado Navarro"
+date: "01 de mayo de 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+    code_folding: none
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  cache     = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+```{r libraries, include=FALSE}
+library(glmnet)
+library(caret)
+library(pROC)
+library(randomForest)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(readr)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+
+col_primary    <- "#2E75B6"
+col_accent     <- "#E8534A"
+col_intermedio <- "#F39C12"
+col_integrado  <- "#27AE60"
+col_b          <- "#8E44AD"  # color exclusivo para Dataset B
+
+set.seed(1229)
+```
+
+---
+
+# Introducción
+
+Este script evalúa el impacto de la variable ganglionar (`ajcc_pathologic_n`) sobre el
+rendimiento predictivo de los modelos desarrollados en el Script 04. La pregunta es
+directa: **¿vale la pena perder ~15% de las muestras a cambio de incluir el estado ganglionar
+como predictor clínico?**
+
+El Script 04 trabaja con **398 muestras** tras excluir los pacientes con estado ganglionar
+desconocido. Si se elimina esa variable, el dataset sube a **462 muestras**, un 25% más,
+lo que beneficia especialmente a la clase Baja, que pasa de n=21 a n=45.
+
+Se comparan dos configuraciones bajo el mismo esquema de validación (repeated CV 5×5):
+
+| Configuración | Variables clínicas | N muestras | Clase Baja |
+|---------------|-------------------|------------|-----------|
+| Dataset A (Script 04) | Estadio T + Ganglios + Enfermedad residual + Edad | 398 | n = 21 |
+| Dataset B (este script) | Estadio T + Enfermedad residual + Edad | 462 | n = 41 |
+
+**Nota:** el modelo GSVA y el modelo integrado también se ven afectados porque el
+dataset de base cambia. Los scores GSVA son los mismos (se calcularon sobre las 497
+muestras en el Script 03), pero el subconjunto analizable varía.
+
+---
+
+# 1. Carga de datos {#carga}
+
+```{r carga, include=FALSE}
+gsva_matrix    <- readRDS("data/processed/gsva_matrix.rds")
+clinical_final <- readRDS("data/processed/clinical_final.rds")
+
+stopifnot(ncol(gsva_matrix) == nrow(clinical_final))
+```
+
+```{r carga-resumen}
+data.frame(
+  Parametro = c(
+    "Muestras totales disponibles",
+    "Endpoint — Baja agresividad",
+    "Endpoint — Agresividad intermedia",
+    "Endpoint — Alta agresividad",
+    "Pacientes con estado ganglionar registrado",
+    "Pacientes sin estado ganglionar (NX o NA)"
+  ),
+  Valor = c(
+    nrow(clinical_final),
+    sum(clinical_final$agresividad == "Baja"),
+    sum(clinical_final$agresividad == "Intermedia"),
+    sum(clinical_final$agresividad == "Alta"),
+    sum(clinical_final$ajcc_pathologic_n %in% c("N0", "N1"), na.rm = TRUE),
+    sum(!clinical_final$ajcc_pathologic_n %in% c("N0", "N1") | 
+          is.na(clinical_final$ajcc_pathologic_n))
+  )
+) %>%
+  kable(caption = "**Tabla 1.** Disponibilidad de datos antes de la construcción de los datasets.",
+        align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(5:6, background = "#EBF5FB")
+```
+
+---
+
+# 2. Construcción de los datasets {#datasets}
+
+```{r datasets, echo=TRUE}
+# Transponer la matriz GSVA
+gsva_df <- as.data.frame(t(gsva_matrix))
+gsva_df$bcr_patient_barcode <- substr(rownames(gsva_df), 1, 12)
+
+# --- DATASET A: con variable ganglionar (replica exacta del Script 04) ---
+clinical_A <- clinical_final %>%
+  dplyr::select(bcr_patient_barcode, agresividad,
+                t_stage_simple, ajcc_pathologic_n,
+                residual_disease, age) %>%
+  mutate(
+    t_stage_num = case_when(
+      t_stage_simple == "T2" ~ 2,
+      t_stage_simple == "T3" ~ 3,
+      t_stage_simple == "T4" ~ 4,
+      TRUE                   ~ NA_real_
+    ),
+    n_stage_num = case_when(
+      ajcc_pathologic_n == "N0" ~ 0,
+      ajcc_pathologic_n == "N1" ~ 1,
+      TRUE                      ~ NA_real_
+    ),
+    residuo_num = case_when(
+      residual_disease == "R0" ~ 0,
+      residual_disease %in% c("R1", "R2") ~ 1,
+      TRUE                     ~ NA_real_
+    )
+  ) %>%
+  filter(!is.na(t_stage_num), !is.na(n_stage_num), !is.na(residuo_num))
+
+dataset_A <- clinical_A %>%
+  left_join(gsva_df, by = "bcr_patient_barcode")
+
+# --- DATASET B: sin variable ganglionar ---
+clinical_B <- clinical_final %>%
+  dplyr::select(bcr_patient_barcode, agresividad,
+                t_stage_simple, residual_disease, age) %>%
+  mutate(
+    t_stage_num = case_when(
+      t_stage_simple == "T2" ~ 2,
+      t_stage_simple == "T3" ~ 3,
+      t_stage_simple == "T4" ~ 4,
+      TRUE                   ~ NA_real_
+    ),
+    residuo_num = case_when(
+      residual_disease == "R0" ~ 0,
+      residual_disease %in% c("R1", "R2") ~ 1,
+      TRUE                     ~ NA_real_
+    )
+  ) %>%
+  filter(!is.na(t_stage_num), !is.na(residuo_num))
+
+dataset_B <- clinical_B %>%
+  left_join(gsva_df, by = "bcr_patient_barcode")
+```
+
+```{r datasets-print}
+data.frame(
+  Configuracion = c("Dataset A (con ganglios)", "Dataset B (sin ganglios)"),
+  N_muestras    = c(nrow(dataset_A), nrow(dataset_B)),
+  N_baja        = c(sum(dataset_A$agresividad == "Baja"),
+                    sum(dataset_B$agresividad == "Baja")),
+  N_intermedia  = c(sum(dataset_A$agresividad == "Intermedia"),
+                    sum(dataset_B$agresividad == "Intermedia")),
+  N_alta        = c(sum(dataset_A$agresividad == "Alta"),
+                    sum(dataset_B$agresividad == "Alta")),
+  Vars_clinicas = c(4, 3)
+) %>%
+  rename(
+    "Configuración"       = Configuracion,
+    "N total"             = N_muestras,
+    "Baja (n)"            = N_baja,
+    "Intermedia (n)"      = N_intermedia,
+    "Alta (n)"            = N_alta,
+    "Variables clínicas"  = Vars_clinicas
+  ) %>%
+  kable(caption = "**Tabla 2.** Comparación de los dos datasets.",
+        align = c("l", "r", "r", "r", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+El Dataset B recupera `r nrow(dataset_B) - nrow(dataset_A)` muestras respecto al A,
+lo que más que duplica el tamaño de la clase Baja
+(`r sum(dataset_A$agresividad == "Baja")` → `r sum(dataset_B$agresividad == "Baja")`
+muestras). Esto puede estabilizar el AUC de la clase minoritaria, aunque a costa de perder
+un predictor clínicamente relevante.
+
+---
+
+# 3. Esquema de validación cruzada {#validacion}
+
+Se usa el mismo esquema que el Script 04; repeated CV estratificada 5×5 (25 iteraciones).
+Los folds se crean de forma independiente para cada dataset para respetar su distinta
+distribución de clases.
+
+```{r cv-setup, echo=TRUE}
+# Folds para Dataset A
+set.seed(1229)
+folds_A <- createMultiFolds(
+  y     = dataset_A$agresividad,
+  k     = 5,
+  times = 5
+)
+y_all_A <- factor(dataset_A$agresividad,
+                  levels = c("Baja", "Intermedia", "Alta"))
+
+# Folds para Dataset B
+set.seed(1229)
+folds_B <- createMultiFolds(
+  y     = dataset_B$agresividad,
+  k     = 5,
+  times = 5
+)
+y_all_B <- factor(dataset_B$agresividad,
+                  levels = c("Baja", "Intermedia", "Alta"))
+```
+
+```{r cv-setup-print}
+cat("=== Dataset A (con ganglios) ===\n")
+cat("Iteraciones:", length(folds_A), "\n")
+cat("Train por fold (aprox):", round(mean(sapply(folds_A, length))), "\n")
+cat("Test por fold (aprox): ",
+    nrow(dataset_A) - round(mean(sapply(folds_A, length))), "\n")
+cat("Distribución de clases (%):\n")
+print(round(prop.table(table(y_all_A)) * 100, 1))
+
+cat("\n=== Dataset B (sin ganglios) ===\n")
+cat("Iteraciones:", length(folds_B), "\n")
+cat("Train por fold (aprox):", round(mean(sapply(folds_B, length))), "\n")
+cat("Test por fold (aprox): ",
+    nrow(dataset_B) - round(mean(sapply(folds_B, length))), "\n")
+cat("Distribución de clases (%):\n")
+print(round(prop.table(table(y_all_B)) * 100, 1))
+```
+
+---
+
+# 4. Función auxiliar de modelado {#funcion}
+
+Para evitar duplicar código, se define una función que corre el pipeline completo
+(Elastic Net con tuning de alpha + Random Forest) sobre cualquier dataset y conjunto
+de folds.
+
+```{r funcion-modelado, echo=TRUE}
+run_models <- function(dataset, folds, y_all, vars_clinicas) {
+
+  alpha_grid <- c(0, 0.25, 0.5, 0.75, 1.0)
+  n_iter     <- length(folds)
+
+  # Matrices de predictores
+  X_clin <- dataset %>%
+    dplyr::select(all_of(vars_clinicas)) %>%
+    as.matrix()
+
+  X_gsva <- dataset %>%
+    dplyr::select(starts_with("HALLMARK_")) %>%
+    as.matrix()
+
+  X_int <- cbind(X_clin, X_gsva)
+
+  # Inicializar vectores y listas
+  auc_clin  <- numeric(n_iter)
+  auc_gsva  <- numeric(n_iter)
+  auc_en    <- numeric(n_iter)
+  auc_rf    <- numeric(n_iter)
+
+  alpha_clin_folds <- numeric(n_iter)
+  alpha_gsva_folds <- numeric(n_iter)
+  alpha_int_folds  <- numeric(n_iter)
+
+  probs_clin_list <- vector("list", n_iter)
+  probs_gsva_list <- vector("list", n_iter)
+  probs_en_list   <- vector("list", n_iter)
+  probs_rf_list   <- vector("list", n_iter)
+  y_test_list     <- vector("list", n_iter)
+
+  tune_alpha <- function(X_train, y_train, alpha_grid) {
+    alpha_grid[which.max(sapply(alpha_grid, function(a) {
+      cv_a <- cv.glmnet(
+        x            = X_train,
+        y            = y_train,
+        family       = "multinomial",
+        alpha        = a,
+        nfolds       = 5,
+        type.measure = "class"
+      )
+      -min(cv_a$cvm)
+    }))]
+  }
+
+  for (i in seq_along(folds)) {
+    idx_train <- folds[[i]]
+    idx_test  <- setdiff(seq_len(nrow(X_int)), idx_train)
+
+    y_test_list[[i]] <- y_all[idx_test]
+
+    # --- Modelo clínico ---
+    set.seed(1229)
+    alpha_clin_folds[i] <- tune_alpha(X_clin[idx_train, ], y_all[idx_train], alpha_grid)
+    set.seed(1229)
+    fit_clin <- cv.glmnet(
+      x = X_clin[idx_train, ], y = y_all[idx_train],
+      family = "multinomial", alpha = alpha_clin_folds[i],
+      nfolds = 5, type.measure = "class"
+    )
+    p_clin <- predict(fit_clin, newx = X_clin[idx_test, ],
+                      s = "lambda.min", type = "response")[, , 1]
+    probs_clin_list[[i]] <- p_clin
+    auc_clin[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_clin)$auc)
+
+    # --- Modelo GSVA ---
+    set.seed(1229)
+    alpha_gsva_folds[i] <- tune_alpha(X_gsva[idx_train, ], y_all[idx_train], alpha_grid)
+    set.seed(1229)
+    fit_gsva <- cv.glmnet(
+      x = X_gsva[idx_train, ], y = y_all[idx_train],
+      family = "multinomial", alpha = alpha_gsva_folds[i],
+      nfolds = 5, type.measure = "class"
+    )
+    p_gsva <- predict(fit_gsva, newx = X_gsva[idx_test, ],
+                      s = "lambda.min", type = "response")[, , 1]
+    probs_gsva_list[[i]] <- p_gsva
+    auc_gsva[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_gsva)$auc)
+
+    # --- Modelo integrado Elastic Net ---
+    set.seed(1229)
+    alpha_int_folds[i] <- tune_alpha(X_int[idx_train, ], y_all[idx_train], alpha_grid)
+    set.seed(1229)
+    fit_en <- cv.glmnet(
+      x = X_int[idx_train, ], y = y_all[idx_train],
+      family = "multinomial", alpha = alpha_int_folds[i],
+      nfolds = 5, type.measure = "class"
+    )
+    p_en <- predict(fit_en, newx = X_int[idx_test, ],
+                    s = "lambda.min", type = "response")[, , 1]
+    probs_en_list[[i]] <- p_en
+    auc_en[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_en)$auc)
+
+    # --- Modelo integrado Random Forest ---
+    set.seed(1229)
+    fit_rf <- randomForest(
+      x = X_int[idx_train, ], y = y_all[idx_train], ntree = 500
+    )
+    p_rf <- predict(fit_rf, newdata = X_int[idx_test, ], type = "prob")
+    probs_rf_list[[i]] <- p_rf
+    auc_rf[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_rf)$auc)
+  }
+
+  list(
+    auc_clin  = auc_clin,
+    auc_gsva  = auc_gsva,
+    auc_en    = auc_en,
+    auc_rf    = auc_rf,
+    alpha_clin = alpha_clin_folds,
+    alpha_gsva = alpha_gsva_folds,
+    alpha_int  = alpha_int_folds,
+    probs_clin = probs_clin_list,
+    probs_gsva = probs_gsva_list,
+    probs_en   = probs_en_list,
+    probs_rf   = probs_rf_list,
+    y_test     = y_test_list,
+    X_clin     = X_clin,
+    X_gsva     = X_gsva,
+    X_int      = X_int,
+    y_all      = y_all
+  )
+}
+```
+
+---
+
+# 5. Ejecución — Dataset A {#resultados-a}
+
+```{r modelos-A, echo=TRUE, cache=TRUE}
+res_A <- run_models(
+  dataset      = dataset_A,
+  folds        = folds_A,
+  y_all        = y_all_A,
+  vars_clinicas = c("t_stage_num", "n_stage_num", "residuo_num", "age")
+)
+```
+
+```{r modelos-A-print}
+cat("=== Dataset A (con ganglios, n =", nrow(dataset_A), ") ===\n\n")
+cat("Modelo clínico    — AUC:", round(mean(res_A$auc_clin), 3),
+    "±", round(sd(res_A$auc_clin), 3), "\n")
+cat("Modelo GSVA       — AUC:", round(mean(res_A$auc_gsva), 3),
+    "±", round(sd(res_A$auc_gsva), 3), "\n")
+cat("Integrado (EN)    — AUC:", round(mean(res_A$auc_en),   3),
+    "±", round(sd(res_A$auc_en),   3), "\n")
+cat("Integrado (RF)    — AUC:", round(mean(res_A$auc_rf),   3),
+    "±", round(sd(res_A$auc_rf),   3), "\n")
+```
+
+---
+
+# 6. Ejecución — Dataset B {#resultados-b}
+
+```{r modelos-B, echo=TRUE, cache=TRUE}
+res_B <- run_models(
+  dataset       = dataset_B,
+  folds         = folds_B,
+  y_all         = y_all_B,
+  vars_clinicas = c("t_stage_num", "residuo_num", "age")
+)
+```
+
+```{r modelos-B-print}
+cat("=== Dataset B (sin ganglios, n =", nrow(dataset_B), ") ===\n\n")
+cat("Modelo clínico    — AUC:", round(mean(res_B$auc_clin), 3),
+    "±", round(sd(res_B$auc_clin), 3), "\n")
+cat("Modelo GSVA       — AUC:", round(mean(res_B$auc_gsva), 3),
+    "±", round(sd(res_B$auc_gsva), 3), "\n")
+cat("Integrado (EN)    — AUC:", round(mean(res_B$auc_en),   3),
+    "±", round(sd(res_B$auc_en),   3), "\n")
+cat("Integrado (RF)    — AUC:", round(mean(res_B$auc_rf),   3),
+    "±", round(sd(res_B$auc_rf),   3), "\n")
+```
+
+---
+
+# 7. Comparación directa A vs B {#comparacion}
+
+## 7.1 Tabla comparativa
+
+```{r tabla-comparacion}
+comparacion <- data.frame(
+  Modelo = rep(c("Clínico", "GSVA", "Integrado (EN)", "Integrado (RF)"), 2),
+  Dataset = c(rep("A — con ganglios (n=398)", 4),
+              rep("B — sin ganglios (n=462)", 4)),
+  AUC_medio = round(c(
+    mean(res_A$auc_clin), mean(res_A$auc_gsva),
+    mean(res_A$auc_en),   mean(res_A$auc_rf),
+    mean(res_B$auc_clin), mean(res_B$auc_gsva),
+    mean(res_B$auc_en),   mean(res_B$auc_rf)
+  ), 3),
+  AUC_DE = round(c(
+    sd(res_A$auc_clin), sd(res_A$auc_gsva),
+    sd(res_A$auc_en),   sd(res_A$auc_rf),
+    sd(res_B$auc_clin), sd(res_B$auc_gsva),
+    sd(res_B$auc_en),   sd(res_B$auc_rf)
+  ), 3)
+)
+
+comparacion %>%
+  mutate(AUC = paste0(AUC_medio, " ± ", AUC_DE)) %>%
+  dplyr::select(Modelo, Dataset, AUC) %>%
+  tidyr::pivot_wider(names_from = Dataset, values_from = AUC) %>%
+  kable(
+    caption = "**Tabla 3.** AUC medio ± DE por modelo y configuración de dataset. Repeated CV 5×5 (25 iteraciones).",
+    align = c("l", "r", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 7.2 Diferencias en AUC (B − A)
+
+```{r tabla-delta}
+data.frame(
+  Modelo = c("Clínico", "GSVA", "Integrado (EN)", "Integrado (RF)"),
+  AUC_A  = round(c(mean(res_A$auc_clin), mean(res_A$auc_gsva),
+                   mean(res_A$auc_en),   mean(res_A$auc_rf)), 3),
+  AUC_B  = round(c(mean(res_B$auc_clin), mean(res_B$auc_gsva),
+                   mean(res_B$auc_en),   mean(res_B$auc_rf)), 3),
+  Delta  = round(c(
+    mean(res_B$auc_clin) - mean(res_A$auc_clin),
+    mean(res_B$auc_gsva) - mean(res_A$auc_gsva),
+    mean(res_B$auc_en)   - mean(res_A$auc_en),
+    mean(res_B$auc_rf)   - mean(res_A$auc_rf)
+  ), 3)
+) %>%
+  mutate(
+    Interpretacion = case_when(
+      Delta >  0.02 ~ "B mejor",
+      Delta < -0.02 ~ "A mejor",
+      TRUE          ~ "Equivalentes"
+    )
+  ) %>%
+  rename(
+    "AUC — Dataset A" = AUC_A,
+    "AUC — Dataset B" = AUC_B,
+    "Δ (B − A)"       = Delta,
+    "Interpretación"  = Interpretacion
+  ) %>%
+  kable(
+    caption = "**Tabla 4.** Diferencia en AUC medio entre Dataset B (sin ganglios) y Dataset A (con ganglios). Valores positivos indican que el Dataset B obtiene mejor AUC.",
+    align = c("l", "r", "r", "r", "l")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 7.3 Gráfico comparativo
+
+```{r plot-comparacion, fig.width=11, fig.height=6, fig.cap="**Figura 1.** AUC por iteración (25 repeated CV) para cada modelo y configuración de dataset. Los puntos azules corresponden al Dataset A (con variable ganglionar, n=398); los puntos morados al Dataset B (sin variable ganglionar, n=462). La barra horizontal indica el AUC medio. Una diferencia sistemática entre colores indica impacto real de la variable ganglionar."}
+
+df_plot <- data.frame(
+  Iter    = rep(seq_along(folds_A), 8),
+  AUC     = c(res_A$auc_clin, res_A$auc_gsva, res_A$auc_en, res_A$auc_rf,
+              res_B$auc_clin, res_B$auc_gsva, res_B$auc_en, res_B$auc_rf),
+  Modelo  = rep(c("Clínico", "GSVA",
+                  "Integrado\n(Elastic Net)",
+                  "Integrado\n(Random Forest)"), each = length(folds_A), times = 2),
+  Dataset = c(rep("A — con ganglios", length(folds_A) * 4),
+              rep("B — sin ganglios", length(folds_B) * 4))
+) %>%
+  mutate(
+    Modelo  = factor(Modelo, levels = c("Clínico", "GSVA",
+                                        "Integrado\n(Elastic Net)",
+                                        "Integrado\n(Random Forest)")),
+    Dataset = factor(Dataset, levels = c("A — con ganglios", "B — sin ganglios"))
+  )
+
+pos <- position_jitterdodge(jitter.width = 0.15, dodge.width = 0.5, seed = 1229)
+
+ggplot(df_plot, aes(x = Modelo, y = AUC, color = Dataset)) +
+  geom_point(size = 2.5, alpha = 0.6, position = pos) +
+  stat_summary(fun = mean, geom = "crossbar",
+               width = 0.35, linewidth = 0.8,
+               position = position_dodge(width = 0.5),
+               show.legend = FALSE) +
+  scale_color_manual(
+    values = c("A — con ganglios" = col_primary,
+               "B — sin ganglios" = col_b)
+  ) +
+  scale_y_continuous(limits = c(0.4, 1.0), breaks = seq(0.4, 1.0, 0.1)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             color = "gray50", linewidth = 0.4) +
+  labs(
+    title    = "Impacto de la variable ganglionar — Comparación A vs B",
+    subtitle = "Repeated CV 5×5 (25 iteraciones). Azul = con ganglios (n=398), Morado = sin ganglios (n=462)",
+    x        = NULL,
+    y        = "AUC-ROC multiclase",
+    color    = "Dataset"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+## 7.4 Variabilidad entre folds
+
+```{r plot-variabilidad, fig.width=10, fig.height=5, fig.cap="**Figura 2.** Desviación estándar del AUC entre las 25 iteraciones por modelo y dataset. Menor DE indica estimados más estables. Se espera que el Dataset B, con más muestras, produzca estimados más estables especialmente en la clase Baja."}
+
+data.frame(
+  Modelo  = rep(c("Clínico", "GSVA", "Integrado (EN)", "Integrado (RF)"), 2),
+  Dataset = c(rep("A — con ganglios", 4), rep("B — sin ganglios", 4)),
+  DE      = round(c(
+    sd(res_A$auc_clin), sd(res_A$auc_gsva),
+    sd(res_A$auc_en),   sd(res_A$auc_rf),
+    sd(res_B$auc_clin), sd(res_B$auc_gsva),
+    sd(res_B$auc_en),   sd(res_B$auc_rf)
+  ), 3)
+) %>%
+  mutate(
+    Modelo  = factor(Modelo, levels = c("Clínico", "GSVA",
+                                        "Integrado (EN)", "Integrado (RF)")),
+    Dataset = factor(Dataset, levels = c("A — con ganglios", "B — sin ganglios"))
+  ) %>%
+  ggplot(aes(x = Modelo, y = DE, fill = Dataset)) +
+  geom_col(position = "dodge", alpha = 0.85, width = 0.6) +
+  scale_fill_manual(
+    values = c("A — con ganglios" = col_primary,
+               "B — sin ganglios" = col_b)
+  ) +
+  labs(
+    title = "Variabilidad del AUC entre folds — Dataset A vs B",
+    x     = NULL,
+    y     = "Desviación estándar (AUC)",
+    fill  = "Dataset"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# 8. Interpretación y decisión {#interpretacion}
+
+```{r interpretacion-setup, include=FALSE}
+delta_clin <- mean(res_B$auc_clin) - mean(res_A$auc_clin)
+delta_en   <- mean(res_B$auc_en)   - mean(res_A$auc_en)
+delta_rf   <- mean(res_B$auc_rf)   - mean(res_A$auc_rf)
+delta_gsva <- mean(res_B$auc_gsva) - mean(res_A$auc_gsva)
+
+ganador_clin <- ifelse(abs(delta_clin) <= 0.02, "equivalentes",
+                ifelse(delta_clin > 0, "Dataset B", "Dataset A"))
+ganador_en   <- ifelse(abs(delta_en)   <= 0.02, "equivalentes",
+                ifelse(delta_en   > 0, "Dataset B", "Dataset A"))
+```
+
+El análisis de sensibilidad muestra que eliminar la variable ganglionar produce un cambio
+de `r round(delta_clin, 3)` puntos en el modelo clínico
+(`r ifelse(delta_clin > 0, "a favor", "en contra")` del Dataset B) y de
+`r round(delta_en, 3)` puntos en el modelo integrado Elastic Net. Ambos modelos son
+**`r ganador_clin`** en términos de AUC.
+
+```{r tabla-decision}
+data.frame(
+  Criterio = c(
+    "AUC modelo clínico (Δ B−A)",
+    "AUC modelo integrado EN (Δ B−A)",
+    "AUC modelo integrado RF (Δ B−A)",
+    "Estabilidad — DE modelo clínico (A vs B)",
+    "Tamaño clase Baja (A vs B)",
+    "Completitud variable ganglionar en TCGA-PRAD",
+    "Relevancia clínica del estado ganglionar"
+  ),
+  Dataset_A = c(
+    round(mean(res_A$auc_clin), 3),
+    round(mean(res_A$auc_en),   3),
+    round(mean(res_A$auc_rf),   3),
+    round(sd(res_A$auc_clin),   3),
+    sum(dataset_A$agresividad == "Baja"),
+    "85.3% cobertura",
+    "Alta (sistema TNM)"
+  ),
+  Dataset_B = c(
+    round(mean(res_B$auc_clin), 3),
+    round(mean(res_B$auc_en),   3),
+    round(mean(res_B$auc_rf),   3),
+    round(sd(res_B$auc_clin),   3),
+    sum(dataset_B$agresividad == "Baja"),
+    "No aplicable",
+    "No incluido"
+  )
+) %>%
+  rename(
+    "Criterio de decisión"       = Criterio,
+    "Dataset A (con ganglios)"   = Dataset_A,
+    "Dataset B (sin ganglios)"   = Dataset_B
+  ) %>%
+  kable(
+    caption = "**Tabla 5.** Criterios cuantitativos y cualitativos para la decisión sobre la variable ganglionar.",
+    align = c("l", "r", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+La diferencia en AUC entre ambas configuraciones es
+`r ifelse(abs(delta_en) <= 0.02, "inferior a 0.02 puntos en todos los modelos, lo que indica que ambas configuraciones son equivalentes en términos de rendimiento predictivo", paste0("de", round(delta_en, 3), "puntos en el modelo integrado"))`.
+La decisión depende por tanto de criterios metodológicos, no de rendimiento:
+
+- **Mantener la variable ganglionar (Dataset A)** es preferible si el objetivo es construir
+un modelo clínicamente completo y comparable con la literatura, asumiendo que la pérdida
+de `r nrow(dataset_B) - nrow(dataset_A)` muestras es aceptable dado que la clase
+Intermedia y Alta siguen bien representadas.
+
+- **Eliminarla (Dataset B)** es preferible si se prioriza el tamaño muestral y la
+estabilidad del estimado para la clase Baja, a costa de un modelo clínico menos informativo.
+
+En cualquier caso, esta limitación se discutirá explícitamente en la memoria como una
+restricción inherente a la cobertura de la variable ganglionar en la cohorte TCGA-PRAD
+(85.3% de disponibilidad).
+
+---
+
+# 9. Guardar outputs {#guardar}
+
+```{r save, echo=TRUE}
+dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+
+# Tabla comparativa completa
+write_csv(comparacion, "results/tables/sensibilidad_ganglionar.csv")
+
+# Dataset B por si se decide usarlo
+saveRDS(dataset_B, "data/processed/dataset_B_sin_ganglios.rds")
+```
+
+---
+
+# 10. Resumen ejecutivo {#resumen}
+
+```{r resumen}
+data.frame(
+  Parametro = c(
+    "Dataset A — N muestras",
+    "Dataset A — AUC clínico",
+    "Dataset A — AUC integrado (EN)",
+    "Dataset A — AUC integrado (RF)",
+    "Dataset B — N muestras",
+    "Dataset B — AUC clínico",
+    "Dataset B — AUC integrado (EN)",
+    "Dataset B — AUC integrado (RF)",
+    "Δ AUC clínico (B − A)",
+    "Δ AUC integrado EN (B − A)",
+    "Δ AUC integrado RF (B − A)",
+    "Conclusión"
+  ),
+  Valor = c(
+    nrow(dataset_A),
+    paste0(round(mean(res_A$auc_clin), 3), " ± ", round(sd(res_A$auc_clin), 3)),
+    paste0(round(mean(res_A$auc_en),   3), " ± ", round(sd(res_A$auc_en),   3)),
+    paste0(round(mean(res_A$auc_rf),   3), " ± ", round(sd(res_A$auc_rf),   3)),
+    nrow(dataset_B),
+    paste0(round(mean(res_B$auc_clin), 3), " ± ", round(sd(res_B$auc_clin), 3)),
+    paste0(round(mean(res_B$auc_en),   3), " ± ", round(sd(res_B$auc_en),   3)),
+    paste0(round(mean(res_B$auc_rf),   3), " ± ", round(sd(res_B$auc_rf),   3)),
+    round(delta_clin, 3),
+    round(delta_en,   3),
+    round(delta_rf,   3),
+    ifelse(abs(delta_en) <= 0.02,
+           "Ambas configuraciones equivalentes — decisión metodológica",
+           ifelse(delta_en > 0,
+                  "Dataset B superior — considerar eliminar ganglios",
+                  "Dataset A superior — mantener ganglios"))
+  )
+) %>%
+  kable(caption = "**Tabla 6.** Resumen del análisis de sensibilidad.",
+        col.names = c("Parámetro", "Valor"),
+        align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(12, bold = TRUE, background = "#EBF5FB")
+```
+
+---
+
+# Referencias
+
+Friedman, J., Hastie, T. y Tibshirani, R. (2010) 'Regularization paths for generalized
+linear models via coordinate descent', *Journal of Statistical Software*, 33(1), pp. 1–22.
+doi: 10.18637/jss.v033.i01.
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,17 @@
+# R data files (too large for GitHub)
+*.rds
+*.rda
+*.RData
+
+# Data directories
+data/
+results/tables/
+
+# R temporary files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# macOS
+.DS_Store

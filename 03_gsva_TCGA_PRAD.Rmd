@@ -1,0 +1,431 @@
+---
+title: "Inferencia de Actividad Metabólica mediante GSVA — TCGA-PRAD"
+subtitle: "TFM — Integración de Transcriptómica Tumoral y Actividad Metabólica Inferida"
+author: "Jose Pablo Delgado Navarro"
+date: "28 de marzo de 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+    code_folding: none
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  message   = FALSE,
+  warning   = FALSE,
+  cache     = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+```{r libraries, include=FALSE}
+library(GSVA)
+library(msigdbr)
+library(SummarizedExperiment)
+library(org.Hs.eg.db)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(limma)
+library(readr)
+library(knitr)
+library(kableExtra)
+
+col_primary    <- "#2E75B6"
+col_accent     <- "#E8534A"
+col_intermedio <- "#F39C12"
+```
+
+---
+
+# Introducción
+
+Este script implementa la inferencia de actividad de rutas biológicas mediante **Gene Set Variation Analysis** (GSVA). Partiendo de la matriz de expresión normalizada generada en el script anterior, se calculan scores de actividad para cada una de las 50 rutas del catálogo **MSigDB Hallmarks**, produciendo una nueva matriz de dimensión reducida que constituye el espacio de variables predictoras para el modelo de clasificación de agresividad tumoral.
+
+## Fundamento del enfoque
+
+El análisis directo sobre genes individuales presenta dos limitaciones fundamentales para el modelado predictivo en oncología; la elevada dimensionalidad (>20.000 genes frente a <500 muestras) y la inestabilidad de los genes individuales como predictores biológicos. GSVA aborda ambos problemas transformando el espacio de representación, en lugar de genes, las variables son **rutas biológicas**, que son más estables, más interpretables y capturan la señal colectiva de programas transcripcionales coordinados.
+
+GSVA calcula, para cada muestra y cada gene set, un score de enriquecimiento no paramétrico basado en la distribución de rangos de expresión de los genes del set respecto al resto del transcriptoma. Los scores resultantes son continuos, centrados en cero, y comparables entre muestras (Hänzelmann, Castelo y Guinney, 2013).
+
+## Elección de los gene sets Hallmarks
+
+Los gene sets **MSigDB Hallmarks** (Liberzon et al., 2015) son una colección de 50 gene sets curados manualmente, cada uno representando un proceso biológico bien definido y no redundante. Su elección está justificada por tres razones:
+
+1. **Relevancia biológica directa** en cáncer de próstata: incluyen `HALLMARK_ANDROGEN_RESPONSE`, `HALLMARK_MYC_TARGETS_V1`, `HALLMARK_GLYCOLYSIS` y `HALLMARK_OXIDATIVE_PHOSPHORYLATION`, entre otras.
+2. **Parsimonia** — 50 variables son manejables para un modelo supervisado con ~500 muestras, evitando los conflictos de la alta dimensionalidad.
+3. **Interpretabilidad** — cada ruta tiene una descripción funcional clara que facilita la interpretación biológica de los resultados.
+
+**Outputs de este script:**
+
+| Archivo | Descripción |
+|---------|-------------|
+| `data/processed/gsva_matrix.rds` | Matriz GSVA (rutas × muestras) |
+| `data/processed/gsva_matrix.csv` | Misma matriz en formato CSV |
+| `results/tables/rutas_diferenciales.csv` | Rutas con actividad diferencial entre grupos |
+
+---
+
+# 1. Carga de datos {#carga}
+
+```{r carga, include=FALSE}
+vst_matrix     <- readRDS("data/processed/vst_matrix.rds")
+clinical_final <- readRDS("data/processed/clinical_final.rds")
+
+stopifnot(
+  ncol(vst_matrix) == nrow(clinical_final),
+  all(substr(colnames(vst_matrix), 1, 12) == clinical_final$bcr_patient_barcode)
+)
+
+# Los rownames tienen formato ENSG00000000003.15
+# Eliminar el sufijo de version (.15, .6, etc.) antes de mapear
+ensembl_ids <- gsub("\\.[0-9]+$", "", rownames(vst_matrix))
+
+# Mapear Ensembl ID -> simbolo HGNC
+map <- mapIds(
+  org.Hs.eg.db,
+  keys     = ensembl_ids,
+  column   = "SYMBOL",
+  keytype  = "ENSEMBL",
+  multiVals = "first"
+)
+
+# Conservar solo genes con simbolo mapeado y no duplicado
+genes_ok     <- !is.na(map) & !duplicated(map)
+vst_matrix   <- vst_matrix[genes_ok, ]
+rownames(vst_matrix) <- map[genes_ok]
+```
+
+```{r carga-print, echo=FALSE, include=TRUE}
+cat("Genes antes de la conversion: ", length(ensembl_ids), "\n")
+cat("Genes con simbolo mapeado:    ", sum(!is.na(map)), "\n")
+cat("Genes tras eliminar duplicados:", nrow(vst_matrix), "\n")
+```
+
+Se cargó la matriz VST con **`r nrow(vst_matrix)` genes** y **`r ncol(vst_matrix)` muestras tumorales**, alineada con la tabla clínica correspondiente.
+
+---
+
+# 2. Gene sets Hallmarks {#genesets}
+
+```{r genesets, echo=TRUE}
+# Descargar gene sets Hallmarks para Homo sapiens desde MSigDB
+hallmarks_df <- msigdbr(species = "Homo sapiens", category = "H")
+
+# Convertir a lista: nombres = ruta, contenido = vector de símbolos génicos
+hallmarks_list <- hallmarks_df %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+```
+
+```{r genesets-print, echo=FALSE, include=TRUE}
+cat("Gene sets Hallmarks descargados:", length(hallmarks_list), "\n")
+```
+
+```{r genesets-cobertura}
+genes_en_matriz <- rownames(vst_matrix)
+cobertura <- sapply(hallmarks_list, function(gs) sum(gs %in% genes_en_matriz))
+
+data.frame(
+  Estadistico = c(
+    "Gene sets totales",
+    "Gene sets con >= 10 genes en la matriz",
+    "Mediana de genes por ruta (en la matriz)",
+    "Rango de genes por ruta (en la matriz)"
+  ),
+  Valor = c(
+    length(hallmarks_list),
+    sum(cobertura >= 10),
+    round(median(cobertura)),
+    paste0(min(cobertura), " — ", max(cobertura))
+  )
+) %>%
+  kable(caption = "**Tabla 2.** Cobertura de los gene sets Hallmarks en la matriz de expresión.",
+        align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+Una cobertura alta confirma que los genes de las rutas Hallmarks están bien representados en la matriz de expresión filtrada, garantizando que los scores GSVA serán informativos.
+
+---
+
+# 3. Ejecución de GSVA {#gsva}
+
+```{r gsva-run, echo=TRUE}
+gsvaPar <- gsvaParam(
+  exprData = vst_matrix,
+  geneSets = hallmarks_list,
+  kcdf     = "Gaussian",
+  minSize  = 10,
+  maxSize  = 500
+)
+
+set.seed(1229)
+gsva_res <- gsva(gsvaPar, verbose = FALSE)
+
+# En versiones recientes de GSVA, gsva() devuelve directamente una matriz
+# En versiones anteriores devuelve un SummarizedExperiment -> usar assay()
+if (is.matrix(gsva_res)) {
+  gsva_matrix <- gsva_res
+} else {
+  gsva_matrix <- assay(gsva_res)
+}
+```
+
+```{r gsva-run-print, echo=FALSE, include=TRUE}
+cat("Rutas en la matriz GSVA:", nrow(gsva_matrix), "\n")
+cat("Muestras:               ", ncol(gsva_matrix), "\n")
+cat("Rango de scores:        ",
+    round(min(gsva_matrix), 3), "—", round(max(gsva_matrix), 3), "\n")
+```
+
+Los scores GSVA son valores continuos aproximadamente en el rango [-1, 1]. Un score positivo indica que los genes de esa ruta están globalmente sobre-expresados en esa muestra respecto a la distribución de la cohorte; un score negativo indica sub-expresión coordinada.
+
+Los scores resultantes cubren el rango `r round(min(gsva_matrix), 2)`–`r round(max(gsva_matrix), 2)`, centrados aproximadamente en cero. Cada valor refleja si los genes de esa ruta están colectivamente sobre o sub-expresados en esa muestra respecto al resto de la cohorte, no en términos absolutos, sino de rango relativo dentro del transcriptoma de cada muestra.
+
+---
+
+# 4. Exploración de los scores GSVA {#exploracion}
+
+## 4.1 Distribución global de scores
+
+```{r scores-dist, fig.cap="**Figura 1.** Distribución global de los scores GSVA para todas las rutas y muestras. La distribución aproximadamente normal centrada en cero es el comportamiento esperado para datos GSVA calculados sobre expresión VST normalizada."}
+data.frame(score = as.vector(gsva_matrix)) %>%
+  ggplot(aes(x = score)) +
+  geom_histogram(bins = 60, fill = col_primary, alpha = 0.8, color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = col_accent, linewidth = 0.8) +
+  labs(title = "Distribución global de scores GSVA — Hallmarks",
+       x     = "Score GSVA",
+       y     = "Frecuencia") +
+  theme_minimal(base_size = 12)
+```
+
+## 4.2 Heatmap de actividad por grupo de agresividad
+
+```{r heatmap, fig.width=11, fig.height=10, fig.cap="**Figura 2.** Heatmap de scores GSVA para las 50 rutas Hallmarks. Las columnas representan muestras tumorales ordenadas por grupo de agresividad; las filas representan rutas biológicas. El gradiente azul-blanco-rojo refleja scores de sub-activación a sobre-activación. Los clústeres de rutas con patrones de activación diferencial entre grupos son candidatos a variables predictoras relevantes para el modelo de clasificación."}
+orden_muestras  <- order(clinical_final$agresividad)
+gsva_ordenado   <- gsva_matrix[, orden_muestras]
+agresividad_ord <- clinical_final$agresividad[orden_muestras]
+
+anotacion_col <- data.frame(
+  Agresividad = agresividad_ord,
+  row.names   = colnames(gsva_ordenado)
+)
+
+colores_anotacion <- list(
+  Agresividad = c(
+    "Baja"       = "#5DADE2",
+    "Intermedia" = col_intermedio,
+    "Alta"       = col_accent
+  )
+)
+
+rownames(gsva_ordenado) <- rownames(gsva_ordenado) %>%
+  gsub("HALLMARK_", "", .) %>%
+  gsub("_", " ", .)
+
+pheatmap(
+  gsva_ordenado,
+  annotation_col    = anotacion_col,
+  annotation_colors = colores_anotacion,
+  show_colnames     = FALSE,
+  cluster_cols      = FALSE,
+  cluster_rows      = TRUE,
+  color             = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  fontsize_row      = 8,
+  main              = "Actividad de rutas Hallmarks — TCGA-PRAD",
+  border_color      = NA
+)
+```
+
+
+El heatmap ya anticipa lo que confirmará el análisis diferencial; la separación entre grupos de agresividad en el espacio GSVA es modesta. No hay un bloque de rutas que se active o desactive limpiamente entre Baja, Intermedia y Alta. La heterogeneidad dentro de cada grupo es comparable a la heterogeneidad entre grupos, lo que explica el poder predictivo limitado del modelo GSVA en solitario que se observará en el Script 04.
+
+---
+
+# 5. Rutas con actividad diferencial {#diferencial}
+
+## 5.1 Análisis con limma
+
+Para identificar las rutas con actividad significativamente diferente entre grupos de agresividad se aplica un modelo lineal con limma (Ritchie et al., 2015), con corrección de Benjamini-Hochberg para controlar la tasa de falsos positivos.
+
+```{r limma, echo=TRUE}
+grupo  <- factor(clinical_final$agresividad,
+                 levels = c("Baja", "Intermedia", "Alta"))
+design <- model.matrix(~grupo)
+colnames(design) <- c("Intercepto", "Intermedia_vs_Baja", "Alta_vs_Baja")
+
+fit <- lmFit(gsva_matrix, design)
+fit <- eBayes(fit)
+
+resultados_alta <- topTable(fit,
+                             coef    = "Alta_vs_Baja",
+                             number  = Inf,
+                             sort.by = "P") %>%
+  rownames_to_column("Ruta") %>%
+  mutate(Ruta = gsub("HALLMARK_", "", Ruta) %>% gsub("_", " ", .))
+
+rutas_sig <- resultados_alta %>% filter(adj.P.Val < 0.05)
+```
+
+```{r limma-print, echo=FALSE}
+cat("Rutas significativas (FDR < 0.05):", nrow(rutas_sig), "\n")
+```
+
+## 5.2 Tabla de rutas diferencialmente activas
+
+```{r tabla-diferencial}
+rutas_sig %>%
+  mutate(
+    logFC     = round(logFC, 3),
+    AveExpr   = round(AveExpr, 3),
+    t         = round(t, 2),
+    P.Value   = formatC(P.Value, format = "e", digits = 2),
+    adj.P.Val = formatC(adj.P.Val, format = "e", digits = 2),
+    Direccion = ifelse(logFC > 0, "Mayor en Alta", "Menor en Alta")
+  ) %>%
+  dplyr::select(Ruta, logFC, AveExpr, t, P.Value, adj.P.Val, Direccion) %>%
+  rename(
+    "Log FC"           = logFC,
+    "Expr. media"      = AveExpr,
+    "Estadístico t"    = t,
+    "p-valor"          = P.Value,
+    "p-valor ajustado" = adj.P.Val,
+    "Dirección"        = Direccion
+  ) %>%
+  kable(
+    caption = "**Tabla 3.** Rutas Hallmarks con actividad diferencial significativa entre el grupo de alta agresividad (Gleason ≥ 8) y el grupo de baja agresividad (Gleason ≤ 6). FDR < 0.05.",
+    align = c("l", "r", "r", "r", "r", "r", "l")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+Solo `r nrow(rutas_sig)` de las 50 rutas alcanzan significación estadística (FDR < 0.05) en el contraste Alta vs Baja, y las tres van en la misma dirección: **menor actividad en los tumores más agresivos**. 
+
+**`r rutas_sig$Ruta[1]`** (logFC = `r round(rutas_sig$logFC[1], 2)`, FDR = `r format(rutas_sig$adj.P.Val[1], scientific=TRUE, digits=2)`): la señalización estrogénica en próstata está ligada a diferenciación luminal y fenotipo menos agresivo. Su caída en Gleason ≥8 es coherente con la pérdida de diferenciación característica de los tumores pobremente diferenciados.
+
+**`r rutas_sig$Ruta[2]`** (logFC = `r round(rutas_sig$logFC[2], 2)`, FDR = `r format(rutas_sig$adj.P.Val[2], scientific=TRUE, digits=2)`): el mismo programa transcripcional en fase tardía, confirmando que la señal no es ruido.
+
+**`r rutas_sig$Ruta[3]`** (logFC = `r round(rutas_sig$logFC[3], 2)`, FDR = `r format(rutas_sig$adj.P.Val[3], scientific=TRUE, digits=2)`): el metabolismo de ácidos biliares en próstata está vinculado al metabolismo lipídico general. Su reducción en tumores agresivos podría reflejar una reprogramación hacia síntesis de novo de ácidos grasos, que favorece proliferación (Zadra et al., 2013).
+
+Que sean solo `r nrow(rutas_sig)` rutas, y con logFCs modestos (máximo `r round(max(abs(rutas_sig$logFC)), 2)` en valor absoluto), ya anticipa el rendimiento predictivo moderado del Script 04. La señal existe, pero es débil.
+
+## 5.3 Volcano plot
+
+```{r volcano, fig.cap="**Figura 3.** Volcano plot del contraste Alta vs Baja agresividad. El eje x representa el log fold-change del score GSVA medio entre grupos; el eje y representa el -log10 del p-valor ajustado. Las rutas en rojo están más activas en tumores de alta agresividad (FDR < 0.05, logFC > 0); las rutas en azul están menos activas. Las rutas grises no alcanzan significación estadística."}
+resultados_alta %>%
+  mutate(
+    sig = case_when(
+      adj.P.Val < 0.05 & logFC > 0 ~ "Mayor en Alta",
+      adj.P.Val < 0.05 & logFC < 0 ~ "Menor en Alta",
+      TRUE                          ~ "No significativa"
+    )
+  ) %>%
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val),
+             color = sig, label = Ruta)) +
+  geom_point(alpha = 0.8, size = 3) +
+  geom_text_repel(
+    data = . %>% filter(adj.P.Val < 0.05),
+    size = 2.8, max.overlaps = 20, box.padding = 0.3
+  ) +
+  scale_color_manual(values = c(
+    "Mayor en Alta"    = col_accent,
+    "Menor en Alta"    = col_primary,
+    "No significativa" = "#AAAAAA"
+  )) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             linewidth = 0.5) +
+  labs(
+    title = "Actividad diferencial — Alta vs Baja agresividad",
+    x     = "Log fold-change (score GSVA)",
+    y     = "-log10(p-valor ajustado)",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# 6. Guardar outputs {#guardar}
+
+```{r save, echo=TRUE}
+saveRDS(gsva_matrix, "data/processed/gsva_matrix.rds")
+
+as.data.frame(gsva_matrix) %>%
+  rownames_to_column("ruta") %>%
+  write_csv("data/processed/gsva_matrix.csv")
+
+write_csv(resultados_alta, "results/tables/rutas_diferenciales.csv")
+```
+
+---
+
+# 7. Resumen ejecutivo {#resumen}
+
+```{r resumen}
+data.frame(
+  Parametro = c(
+    "Gene sets utilizados",
+    "Catálogo de rutas",
+    "Método de inferencia",
+    "Parámetro kcdf",
+    "Rutas en la matriz GSVA",
+    "Muestras en la matriz GSVA",
+    "Rango de scores GSVA",
+    "Rutas significativas (FDR < 0.05, Alta vs Baja)",
+    "Fecha de procesado",
+    "Siguiente script"
+  ),
+  Valor = c(
+    "MSigDB Hallmarks (colección H)",
+    "Liberzon et al. (2015), Cell Systems",
+    "GSVA (Hänzelmann, Castelo y Guinney, 2013)",
+    "Gaussian (datos VST continuos)",
+    as.character(nrow(gsva_matrix)),
+    as.character(ncol(gsva_matrix)),
+    paste0(round(min(gsva_matrix), 3), " — ", round(max(gsva_matrix), 3)),
+    as.character(nrow(rutas_sig)),
+    "2026-03-29",
+    "04_modelado.Rmd"
+  )
+) %>%
+  kable(caption = "**Tabla 4.** Resumen del análisis GSVA.",
+        col.names = c("Parámetro", "Valor"),
+        align = c("l", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(5:8, background = "#EBF5FB")
+```
+
+---
+
+# Referencias
+
+Hänzelmann, S., Castelo, R. y Guinney, J. (2013) 'GSVA: gene set variation analysis for microarray and RNA-Seq data', *BMC Bioinformatics*, 14, p. 7. doi: 10.1186/1471-2105-14-7.
+
+Liberzon, A., Birger, C., Thorvaldsdóttir, H., Ghandi, M., Mesirov, J.P. y Tamayo, P. (2015) 'The Molecular Signatures Database (MSigDB) hallmark gene set collection', *Cell Systems*, 1(6), pp. 417–425. doi: 10.1016/j.cels.2015.12.004.
+
+Ritchie, M.E., Phipson, B., Wu, D., Hu, Y., Law, C.W., Shi, W. y Smyth, G.K. (2015) 'limma powers differential expression analyses for RNA-sequencing and microarray studies', *Nucleic Acids Research*, 43(7), p. e47. doi: 10.1093/nar/gkv007.
+
+```{r session-info}
+sessionInfo()
+```

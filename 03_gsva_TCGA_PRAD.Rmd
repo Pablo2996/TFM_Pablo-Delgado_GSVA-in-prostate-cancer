@@ -47,6 +47,9 @@ library(readr)
 library(knitr)
 library(kableExtra)
 
+FIG_DIR <- "../TFM_PEC4/figuras"
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
 col_primary    <- "#2E75B6"
 col_accent     <- "#E8534A"
 col_intermedio <- "#F39C12"
@@ -82,11 +85,11 @@ Los gene sets **MSigDB Hallmarks** (Liberzon et al., 2015) son una colección de
 
 ---
 
-# 1. Carga de datos {#carga}
+# Carga de datos {#carga}
 
 ```{r carga, include=FALSE}
 vst_matrix     <- readRDS("data/processed/vst_matrix.rds")
-clinical_final <- readRDS("data/processed/clinical_final.rds")
+clinical_final <- readRDS("data/processed/clinical_preprocessed.rds")
 
 stopifnot(
   ncol(vst_matrix) == nrow(clinical_final),
@@ -122,7 +125,7 @@ Se cargó la matriz VST con **`r nrow(vst_matrix)` genes** y **`r ncol(vst_matri
 
 ---
 
-# 2. Gene sets Hallmarks {#genesets}
+# Gene sets Hallmarks {#genesets}
 
 ```{r genesets, echo=TRUE}
 # Descargar gene sets Hallmarks para Homo sapiens desde MSigDB
@@ -164,7 +167,7 @@ Una cobertura alta confirma que los genes de las rutas Hallmarks están bien rep
 
 ---
 
-# 3. Ejecución de GSVA {#gsva}
+# Ejecución de GSVA {#gsva}
 
 ```{r gsva-run, echo=TRUE}
 gsvaPar <- gsvaParam(
@@ -200,9 +203,9 @@ Los scores resultantes cubren el rango `r round(min(gsva_matrix), 2)`–`r round
 
 ---
 
-# 4. Exploración de los scores GSVA {#exploracion}
+# Exploración de los scores GSVA {#exploracion}
 
-## 4.1 Distribución global de scores
+## Distribución global de scores
 
 ```{r scores-dist, fig.cap="**Figura 1.** Distribución global de los scores GSVA para todas las rutas y muestras. La distribución aproximadamente normal centrada en cero es el comportamiento esperado para datos GSVA calculados sobre expresión VST normalizada."}
 data.frame(score = as.vector(gsva_matrix)) %>%
@@ -214,18 +217,15 @@ data.frame(score = as.vector(gsva_matrix)) %>%
        x     = "Score GSVA",
        y     = "Frecuencia") +
   theme_minimal(base_size = 12)
+ggsave(file.path(FIG_DIR, "gsva-boxplot.png"), plot = last_plot(), width = 8, height = 5, dpi = 150)
 ```
 
-## 4.2 Heatmap de actividad por grupo de agresividad
+## Heatmap de actividad por grupo de agresividad
 
-```{r heatmap, fig.width=11, fig.height=10, fig.cap="**Figura 2.** Heatmap de scores GSVA para las 50 rutas Hallmarks. Las columnas representan muestras tumorales ordenadas por grupo de agresividad; las filas representan rutas biológicas. El gradiente azul-blanco-rojo refleja scores de sub-activación a sobre-activación. Los clústeres de rutas con patrones de activación diferencial entre grupos son candidatos a variables predictoras relevantes para el modelo de clasificación."}
-orden_muestras  <- order(clinical_final$agresividad)
-gsva_ordenado   <- gsva_matrix[, orden_muestras]
-agresividad_ord <- clinical_final$agresividad[orden_muestras]
-
+```{r heatmap, fig.width=11, fig.height=10, fig.cap="**Figura 2.** Heatmap de scores GSVA para las 50 rutas Hallmarks. Las filas representan rutas biológicas agrupadas por similitud de activación (dendrograma de filas); las columnas representan muestras tumorales agrupadas por similitud transcriptómica (dendrograma de columnas), con la barra de anotación indicando el grupo de agresividad. El gradiente azul-blanco-rojo refleja scores de sub-activación a sobre-activación. La superposición entre grupos en el dendrograma de columnas anticipa el poder predictivo moderado del modelo GSVA en solitario."}
 anotacion_col <- data.frame(
-  Agresividad = agresividad_ord,
-  row.names   = colnames(gsva_ordenado)
+  Agresividad = clinical_final$agresividad,
+  row.names   = colnames(gsva_matrix)
 )
 
 colores_anotacion <- list(
@@ -236,32 +236,34 @@ colores_anotacion <- list(
   )
 )
 
-rownames(gsva_ordenado) <- rownames(gsva_ordenado) %>%
+gsva_plot <- gsva_matrix
+rownames(gsva_plot) <- rownames(gsva_plot) %>%
   gsub("HALLMARK_", "", .) %>%
   gsub("_", " ", .)
 
-pheatmap(
-  gsva_ordenado,
+p_heat <- pheatmap(
+  gsva_plot,
   annotation_col    = anotacion_col,
   annotation_colors = colores_anotacion,
   show_colnames     = FALSE,
-  cluster_cols      = FALSE,
+  cluster_cols      = TRUE,
   cluster_rows      = TRUE,
   color             = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
   fontsize_row      = 8,
   main              = "Actividad de rutas Hallmarks — TCGA-PRAD",
   border_color      = NA
 )
+ggsave(file.path(FIG_DIR, "gsva-heatmap.png"), plot = p_heat$gtable, width = 11, height = 10, dpi = 150)
 ```
 
 
-El heatmap ya anticipa lo que confirmará el análisis diferencial; la separación entre grupos de agresividad en el espacio GSVA es modesta. No hay un bloque de rutas que se active o desactive limpiamente entre Baja, Intermedia y Alta. La heterogeneidad dentro de cada grupo es comparable a la heterogeneidad entre grupos, lo que explica el poder predictivo limitado del modelo GSVA en solitario que se observará en el Script 04.
+La Figura 2 muestra el heatmap de actividad de las 50 rutas Hallmarks. El dendrograma de columnas agrupa las muestras según su similitud transcriptómica global: si los grupos de agresividad formasen clusters compactos y separados, las muestras de cada color aparecerían juntas. Lo que se observa, en cambio, es una mezcla de los tres grupos en la mayoría de ramas del dendrograma. La separación entre grupos en el espacio GSVA es modesta. No hay un bloque de rutas que se active o desactive limpiamente entre Baja, Intermedia y Alta. La heterogeneidad dentro de cada grupo es comparable a la heterogeneidad entre grupos, lo que explica el poder predictivo limitado del modelo GSVA en solitario que se observará en el Script 04.
 
 ---
 
-# 5. Rutas con actividad diferencial {#diferencial}
+# Rutas con actividad diferencial {#diferencial}
 
-## 5.1 Análisis con limma
+## Análisis con limma
 
 Para identificar las rutas con actividad significativamente diferente entre grupos de agresividad se aplica un modelo lineal con limma (Ritchie et al., 2015), con corrección de Benjamini-Hochberg para controlar la tasa de falsos positivos.
 
@@ -288,7 +290,7 @@ rutas_sig <- resultados_alta %>% filter(adj.P.Val < 0.05)
 cat("Rutas significativas (FDR < 0.05):", nrow(rutas_sig), "\n")
 ```
 
-## 5.2 Tabla de rutas diferencialmente activas
+## Tabla de rutas diferencialmente activas
 
 ```{r tabla-diferencial}
 rutas_sig %>%
@@ -327,7 +329,7 @@ Solo `r nrow(rutas_sig)` de las 50 rutas alcanzan significación estadística (F
 
 Que sean solo `r nrow(rutas_sig)` rutas, y con logFCs modestos (máximo `r round(max(abs(rutas_sig$logFC)), 2)` en valor absoluto), ya anticipa el rendimiento predictivo moderado del Script 04. La señal existe, pero es débil.
 
-## 5.3 Volcano plot
+## Volcano plot
 
 ```{r volcano, fig.cap="**Figura 3.** Volcano plot del contraste Alta vs Baja agresividad. El eje x representa el log fold-change del score GSVA medio entre grupos; el eje y representa el -log10 del p-valor ajustado. Las rutas en rojo están más activas en tumores de alta agresividad (FDR < 0.05, logFC > 0); las rutas en azul están menos activas. Las rutas grises no alcanzan significación estadística."}
 resultados_alta %>%
@@ -362,11 +364,12 @@ resultados_alta %>%
   ) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom")
+ggsave(file.path(FIG_DIR, "gsva-volcano.png"), plot = last_plot(), width = 8, height = 6, dpi = 150)
 ```
 
 ---
 
-# 6. Guardar outputs {#guardar}
+# Guardar outputs {#guardar}
 
 ```{r save, echo=TRUE}
 saveRDS(gsva_matrix, "data/processed/gsva_matrix.rds")

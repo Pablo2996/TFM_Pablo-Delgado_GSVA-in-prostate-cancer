@@ -45,6 +45,9 @@ library(readr)
 library(knitr)
 library(kableExtra)
 
+FIG_DIR <- "../TFM_PEC4/figuras"
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
 col_primary   <-  "#2E75B6"
 col_accent    <-  "#E8534A"
 col_intermedio <- "#F39C12"
@@ -67,15 +70,15 @@ Este script construye y compara tres modelos predictivos de agresividad tumoral 
 | GSVA | Scores de actividad de 50 rutas Hallmarks | 50 variables |
 | Integrado | Clínico + GSVA | 54 variables |
 
-**Nota metodológica importante:** el Gleason score ha sido excluido deliberadamente del modelo clínico porque constituye la base directa del endpoint de agresividad (Baja/Intermedia/Alta). Su inclusión introduciría data leakage y produciría estimaciones de rendimiento artificialmente infladas. Las variables clínicas seleccionadas — estadio T, ganglios, enfermedad residual y edad — son independientes del Gleason y representan información clínica disponible en la práctica asistencial.
+**Nota metodológica importante:** el Gleason score ha sido excluido deliberadamente del modelo clínico porque constituye la base directa del endpoint de agresividad (Baja/Intermedia/Alta). Su inclusión introduciría data leakage y produciría estimaciones de rendimiento artificialmente infladas. Las variables clínicas seleccionadas; estadio T, ganglios, enfermedad residual y edad son independientes del Gleason y representan información clínica disponible en la práctica asistencial.
 
 ---
 
-# 1. Carga de datos {#carga}
+# Carga de datos {#carga}
 
 ```{r carga, include=FALSE}
 gsva_matrix    <- readRDS("data/processed/gsva_matrix.rds")
-clinical_final <- readRDS("data/processed/clinical_final.rds")
+clinical_final <- readRDS("data/processed/clinical_preprocessed.rds")
 
 stopifnot(
   ncol(gsva_matrix) == nrow(clinical_final)
@@ -107,7 +110,7 @@ data.frame(
 
 ---
 
-# 2. Construcción del dataset integrado {#dataset}
+# Construcción del dataset integrado {#dataset}
 
 ```{r dataset, echo=TRUE}
 # Transponer la matriz GSVA: muestras en filas, rutas en columnas
@@ -183,7 +186,7 @@ data.frame(
 
 ---
 
-# 3. Esquema de validación cruzada {#validacion}
+# Esquema de validación cruzada {#validacion}
 
 Se utiliza validación cruzada estratificada de **5 folds**, que garantiza que cada fold mantiene la misma proporción de las tres clases de agresividad que el dataset completo. Para cada fold: (1) entrenar el modelo en los 4 folds restantes con selección de λ óptimo por validación cruzada interna, (2) predecir probabilidades de clase en el fold de test, (3) calcular AUC-ROC multiclase como promedio de AUC uno-contra-todos.
 
@@ -199,6 +202,18 @@ folds <- createMultiFolds(
 
 y_all <- factor(dataset_integrado$agresividad,
                 levels = c("Baja", "Intermedia", "Alta"))
+
+# AUC multiclase como promedio de AUC uno-contra-todos.
+# Evita pasar una matriz a multiclass.roc(), que falla en pROC < 1.18.
+auc_ova <- function(y_true, probs_mat) {
+  classes <- levels(y_true)
+  aucs <- sapply(classes, function(cls) {
+    y_bin <- as.integer(y_true == cls)
+    if (length(unique(y_bin)) < 2) return(NA_real_)
+    as.numeric(auc(roc(y_bin, probs_mat[, cls], quiet = TRUE)))
+  })
+  mean(aucs, na.rm = TRUE)
+}
 ```
 
 ```{r cv-setup-print, echo=FALSE, include=TRUE}
@@ -226,7 +241,7 @@ distribución resultante —`r round(prop.table(table(y_all))["Baja"] * 100, 1)`
 
 ---
 
-# 4. Modelo clínico {#modelo-clinico}
+# Modelo clínico {#modelo-clinico}
 
 ```{r modelo-clinico, echo=TRUE, cache=TRUE}
 X_clinico <- dataset_integrado %>%
@@ -270,15 +285,13 @@ for (i in seq_along(folds)) {
 
   probs <- predict(cv_fit, newx = X_clinico[idx_test, ],
                    s = "lambda.min", type = "response")
-  probs <- probs[, , 1]
+  if (length(dim(probs)) == 3) probs <- probs[, , 1]
 
   # Guardar probabilidades y clases reales para curvas ROC
   probs_clinico_list[[i]] <- probs
   y_test_list[[i]]        <- y_all[idx_test]
 
-  roc_obj        <- multiclass.roc(response  = y_all[idx_test],
-                                   predictor = probs)
-  auc_clinico[i] <- as.numeric(roc_obj$auc)
+  auc_clinico[i] <- auc_ova(y_all[idx_test], probs)
 }
 ```
 
@@ -301,7 +314,7 @@ coeficientes sin eliminarlos— gana consistentemente sobre Lasso.
 
 ---
 
-# 5. Modelo GSVA {#modelo-gsva}
+# Modelo GSVA {#modelo-gsva}
 
 ```{r modelo-gsva, echo=TRUE, cache=TRUE}
 X_gsva <- dataset_integrado %>%
@@ -344,14 +357,12 @@ for (i in seq_along(folds)) {
 
   probs <- predict(cv_fit, newx = X_gsva[idx_test, ],
                    s = "lambda.min", type = "response")
-  probs <- probs[, , 1]
+  if (length(dim(probs)) == 3) probs <- probs[, , 1]
 
   # Guardar probabilidades para curvas ROC
   probs_gsva_list[[i]] <- probs
 
-  roc_obj     <- multiclass.roc(response  = y_all[idx_test],
-                                predictor = probs)
-  auc_gsva[i] <- as.numeric(roc_obj$auc)
+  auc_gsva[i] <- auc_ova(y_all[idx_test], probs)
 }
 ```
 
@@ -378,7 +389,7 @@ agresividad en el espacio GSVA, y el AUC refleja eso.
 
 ---
 
-# 6. Modelo integrado {#modelo-integrado}
+# Modelo integrado {#modelo-integrado}
 
 ```{r modelo-integrado, echo=TRUE, cache=TRUE}
 X_integrado <- dataset_integrado %>%
@@ -395,6 +406,10 @@ best_alpha_int_folds  <- numeric(length(folds))
 probs_integrado_list  <- vector("list", length(folds))
 probs_rf_list         <- vector("list", length(folds))
 y_test_list           <- vector("list", length(folds))
+# Coeficientes por fold (para mostrar variabilidad entre iteraciones)
+coef_list_folds       <- vector("list", length(folds))
+# Importancia RF por fold (para mostrar variabilidad entre folds de entrenamiento)
+imp_rf_list           <- vector("list", length(folds))
 
 for (i in seq_along(folds)) {
   idx_train <- folds[[i]]
@@ -426,31 +441,31 @@ for (i in seq_along(folds)) {
 
   probs <- predict(cv_fit, newx = X_integrado[idx_test, ],
                    s = "lambda.min", type = "response")
-  probs <- probs[, , 1]
+  if (length(dim(probs)) == 3) probs <- probs[, , 1]
 
   probs_integrado_list[[i]] <- probs
   y_test_list[[i]]          <- y_all[idx_test]
+  coef_list_folds[[i]]      <- coef(cv_fit, s = "lambda.min")
 
-  roc_obj          <- multiclass.roc(response  = y_all[idx_test],
-                                     predictor = probs)
-  auc_integrado[i] <- as.numeric(roc_obj$auc)
+  auc_integrado[i] <- auc_ova(y_all[idx_test], probs)
 
   # --- Random Forest ---
   set.seed(1229)
   rf_fit <- randomForest(
-    x     = X_integrado[idx_train, ],
-    y     = y_all[idx_train],
-    ntree = 500
+    x          = X_integrado[idx_train, ],
+    y          = y_all[idx_train],
+    ntree      = 500,
+    importance = TRUE
   )
 
   probs_rf <- predict(rf_fit, newdata = X_integrado[idx_test, ],
                       type = "prob")
+  if (!is.matrix(probs_rf)) probs_rf <- as.matrix(probs_rf)
 
   probs_rf_list[[i]] <- probs_rf
+  imp_rf_list[[i]]   <- importance(rf_fit, type = 2)
 
-  roc_rf    <- multiclass.roc(response  = y_all[idx_test],
-                               predictor = probs_rf)
-  auc_rf[i] <- as.numeric(roc_rf$auc)
+  auc_rf[i] <- auc_ova(y_all[idx_test], probs_rf)
 }
 
 # Modelo final entrenado en TODO el dataset — solo para interpretacion
@@ -578,6 +593,7 @@ ggplot(cvm_df, aes(x = Alpha, y = Error_CV,
   ) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "right")
+ggsave(file.path(FIG_DIR, "plot-hiperparametros.png"), plot = last_plot(), width = 10, height = 5, dpi = 150)
 ```
 
 Las curvas son llamativamente planas. En `r length(folds)` iteraciones, el error interno
@@ -590,9 +606,9 @@ el eje, por lo que no hay un ganador claro, hay varios empates técnicos.
 
 ---
 
-# 7. Comparación de modelos {#comparacion}
+# Comparación de modelos {#comparacion}
 
-## 7.1 Tabla comparativa de AUC-ROC
+## Tabla comparativa de AUC-ROC
 
 ```{r tabla-comparacion}
 resultados_cv <- data.frame(
@@ -632,45 +648,51 @@ Todos los modelos superan AUC 0.5, así que hay señal real. El GSVA solo es el 
 predictores, más variabilidad entre particiones.
 
 
-## 7.2 Gráfico comparativo por fold
+## Gráfico comparativo por fold
 
-```{r plot-comparacion, fig.cap="**Figura 2.** AUC multiclase por fold de validación para cada modelo. Los puntos representan el AUC en cada uno de los 5 folds; la barra horizontal representa el AUC medio. Una mayor separación entre los puntos del modelo integrado respecto al clínico indica valor incremental de la integración metabólica."}
-# --- Figura 1: AUC por fold por modelo ---
+```{r plot-comparacion, fig.cap="**Figura 2.** Distribución del AUC multiclase por modelo en las 25 iteraciones de validación cruzada repetida (5 folds × 5 repeticiones). El violín muestra la forma de la distribución; el boxplot interior marca la mediana y el rango intercuartílico; los puntos representan cada iteración individual. La línea discontinua marca AUC = 0.5 (clasificación aleatoria)."}
 data.frame(
-  Fold = rep(seq_along(folds), 4),
+  Iteracion = rep(seq_along(folds), 4),
   AUC    = c(auc_clinico, auc_gsva, auc_integrado, auc_rf),
   Modelo = rep(c("Clínico", "GSVA",
                  "Integrado\n(Elastic Net)",
-                 "Integrado\n(Random Forest)"), each = 5)
+                 "Integrado\n(Random Forest)"), each = length(folds))
 ) %>%
   mutate(Modelo = factor(Modelo,
                          levels = c("Clínico", "GSVA",
                                     "Integrado\n(Elastic Net)",
                                     "Integrado\n(Random Forest)"))) %>%
-  ggplot(aes(x = Modelo, y = AUC, color = Modelo)) +
-  geom_jitter(width = 0.1, size = 4, alpha = 0.8) +
-  stat_summary(fun = mean, geom = "crossbar",
-               width = 0.4, linewidth = 0.8,
-               show.legend = FALSE) +
+  ggplot(aes(x = Modelo, y = AUC, color = Modelo, fill = Modelo)) +
+  geom_violin(alpha = 0.15, linewidth = 0.5, trim = FALSE) +
+  geom_boxplot(width = 0.18, alpha = 0.6, outlier.shape = NA,
+               color = "gray30", linewidth = 0.6) +
+  geom_jitter(width = 0.07, size = 2.5, alpha = 0.75) +
   scale_color_manual(values = c(
-    "Clínico"                  = col_primary,
-    "GSVA"                     = col_intermedio,
-    "Integrado\n(Elastic Net)" = col_integrado,
-    "Integrado\n(Random Forest)" = col_accent
+    "Clínico"                     = col_primary,
+    "GSVA"                        = col_intermedio,
+    "Integrado\n(Elastic Net)"    = col_integrado,
+    "Integrado\n(Random Forest)"  = col_accent
   )) +
-  scale_y_continuous(limits = c(0.4, 1.0),
+  scale_fill_manual(values = c(
+    "Clínico"                     = col_primary,
+    "GSVA"                        = col_intermedio,
+    "Integrado\n(Elastic Net)"    = col_integrado,
+    "Integrado\n(Random Forest)"  = col_accent
+  )) +
+  scale_y_continuous(limits = c(0.35, 1.0),
                      breaks = seq(0.4, 1.0, 0.1)) +
   geom_hline(yintercept = 0.5, linetype = "dashed",
              color = "gray50", linewidth = 0.5) +
   labs(
-    title    = "Rendimiento predictivo por modelo — Validación cruzada (5 folds)",
-    subtitle = "AUC multiclase (promedio uno-contra-todos)",
+    title    = "Rendimiento predictivo por modelo — Repeated CV (5 folds × 5 rep.)",
+    subtitle = "AUC multiclase (promedio uno-contra-todos) — 25 iteraciones por modelo",
     x        = NULL,
     y        = "AUC-ROC multiclase",
     color    = NULL
   ) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "none")
+ggsave(file.path(FIG_DIR, "plot-comparacion.png"), plot = last_plot(), width = 8, height = 6, dpi = 150)
 ```
 
 ```{r plot-probabilidades, fig.width=10, fig.height=5, fig.cap="**Figura 3.** Distribución de probabilidades predichas por clase (Elastic Net, modelo integrado) en los folds de test. Cada punto representa una muestra; el color indica la clase real. Un modelo bien calibrado produce probabilidades altas para la clase correcta y bajas para las incorrectas."}
@@ -706,6 +728,7 @@ data.frame(
   ) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
+ggsave(file.path(FIG_DIR, "plot-probabilidades.png"), plot = last_plot(), width = 10, height = 5, dpi = 150)
 ```
 
 La clase Intermedia (Gleason 7, n = `r sum(dataset_integrado$agresividad == "Intermedia")`)
@@ -840,6 +863,7 @@ ggplot(roc_df, aes(x = FPR, y = TPR,
     strip.text       = element_text(face = "bold", size = 12),
     panel.grid.minor = element_blank()
   )
+ggsave(file.path(FIG_DIR, "plot-roc-curvas.png"), plot = last_plot(), width = 12, height = 8, dpi = 150)
 ```
 
 Las curvas confirman lo de la tabla; Alta es donde los modelos discriminan mejor, Intermedia
@@ -850,50 +874,96 @@ ese número. La ventaja del integrado Elastic Net sobre el clínico
 Alta, lo que sugiere que la información metabólica aporta principalmente donde más importa
 clínicamente, identificar los tumores más agresivos.
 
-```{r plot-coeficientes, fig.width=10, fig.height=10, fig.cap="**Figura 5.** *Arriba:* Coeficientes del modelo integrado Elastic Net entrenado en el dataset completo (solo para interpretación). Se muestran las 15 variables con mayor coeficiente absoluto por clase. *Abajo:* Importancia de variables del modelo Random Forest (Mean Decrease Gini). IMPORTANTE: estos modelos están entrenados en todo el dataset y no deben usarse para reportar rendimiento predictivo."}
-# --- Coeficientes Elastic Net ---
-coef_list <- coef(cv_fit_final, s = "lambda.min")
-clases    <- c("Baja", "Intermedia", "Alta")
+```{r plot-coeficientes, fig.width=10, fig.height=12, fig.cap="**Figura 5.** *Arriba:* Coeficientes del modelo integrado Elastic Net a lo largo de las 25 iteraciones de validación cruzada. Cada punto representa el coeficiente estimado en una iteración; la barra central muestra la media y los segmentos ± 1 DE. Se muestran las 12 variables con mayor coeficiente absoluto medio por clase. Variables con barras que no cruzan el cero tienen una dirección consistente entre folds. *Abajo:* Importancia media de variables del Random Forest sobre las 25 iteraciones de entrenamiento (Mean Decrease Gini, top 20)."}
+library(patchwork)
 
-coef_df <- lapply(seq_along(clases), function(j) {
-  m <- as.matrix(coef_list[[j]])
-  data.frame(
-    Variable   = rownames(m),
-    Coeficiente = m[, 1],
-    Clase      = clases[j]
-  )
+clases <- c("Baja", "Intermedia", "Alta")
+
+# --- Coeficientes por fold (variabilidad entre iteraciones) ---
+coef_folds_df <- lapply(seq_along(folds), function(i) {
+  lapply(seq_along(clases), function(j) {
+    m <- as.matrix(coef_list_folds[[i]][[j]])
+    data.frame(
+      Variable    = rownames(m),
+      Coeficiente = m[, 1],
+      Clase       = clases[j],
+      Fold        = i
+    )
+  }) %>% bind_rows()
 }) %>%
   bind_rows() %>%
-  filter(Variable != "(Intercept)", Coeficiente != 0) %>%
+  filter(Variable != "(Intercept)") %>%
   mutate(Variable = gsub("HALLMARK_", "", Variable))
 
-# Top 15 por clase segun valor absoluto
-coef_top <- coef_df %>%
+# Media y DE por variable y clase
+coef_summary <- coef_folds_df %>%
+  group_by(Variable, Clase) %>%
+  summarise(
+    media = mean(Coeficiente),
+    de    = sd(Coeficiente),
+    .groups = "drop"
+  )
+
+# Top 12 variables por clase según |media|
+top_vars_por_clase <- coef_summary %>%
   group_by(Clase) %>%
-  slice_max(order_by = abs(Coeficiente), n = 15) %>%
+  slice_max(order_by = abs(media), n = 12) %>%
   ungroup()
 
-p_coef <- ggplot(coef_top,
-                 aes(x = reorder(Variable, Coeficiente),
-                     y = Coeficiente,
-                     fill = Coeficiente > 0)) +
-  geom_col() +
-  facet_wrap(~Clase, scales = "free_y") +
+# Unir con datos de folds individuales para los puntos
+coef_top_folds <- coef_folds_df %>%
+  semi_join(top_vars_por_clase, by = c("Variable", "Clase"))
+
+coef_top_summary <- coef_summary %>%
+  semi_join(top_vars_por_clase, by = c("Variable", "Clase"))
+
+# Precomputar el orden de Variable como factor en ambos dataframes,
+# para que geom_jitter (con data = coef_top_folds) no herede reorder(Variable, media)
+# y falle al no encontrar 'media' en ese dataframe.
+var_levels <- coef_top_summary %>%
+  group_by(Variable) %>%
+  summarise(abs_media_global = mean(abs(media)), .groups = "drop") %>%
+  arrange(abs_media_global) %>%
+  pull(Variable)
+
+coef_top_summary <- coef_top_summary %>%
+  mutate(Variable = factor(Variable, levels = var_levels))
+
+coef_top_folds <- coef_top_folds %>%
+  mutate(Variable = factor(Variable, levels = var_levels))
+
+p_coef <- ggplot(coef_top_summary,
+                 aes(x = Variable,
+                     y = media,
+                     color = media > 0)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "gray60", linewidth = 0.4) +
+  geom_jitter(data = coef_top_folds,
+              aes(x = Variable, y = Coeficiente),
+              inherit.aes = FALSE,
+              color = "gray40",
+              width = 0, height = 0,
+              alpha = 0.25, size = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = media - de, ymax = media + de),
+                width = 0.3, linewidth = 0.7) +
+  facet_wrap(~Clase, scales = "free") +
   coord_flip() +
-  scale_fill_manual(values = c("TRUE" = col_integrado, "FALSE" = col_accent),
-                    labels = c("TRUE" = "Positivo", "FALSE" = "Negativo")) +
+  scale_color_manual(values = c("TRUE" = col_integrado, "FALSE" = col_accent),
+                     labels = c("TRUE" = "Positivo", "FALSE" = "Negativo")) +
   labs(
-    title  = "Coeficientes Elastic Net — Modelo integrado (entrenado en dataset completo)",
-    subtitle = "Solo para interpretación — no usar para evaluar rendimiento",
-    x      = NULL,
-    y      = "Coeficiente",
-    fill   = "Dirección"
+    title    = "Coeficientes Elastic Net — variabilidad entre folds de entrenamiento",
+    subtitle = "Media ± Desviación Estándar sobre 25 iteraciones de repeated CV. Puntos = coeficiente individual por iteración.",
+    x        = NULL,
+    y        = "Coeficiente",
+    color    = "Dirección"
   ) +
-  theme_minimal(base_size = 10) +
+  theme_minimal(base_size = 9) +
   theme(legend.position = "bottom")
 
-# --- Importancia Random Forest ---
-imp_df <- importance(rf_fit_final, type = 2) %>%
+# --- Importancia Random Forest (media sobre folds de entrenamiento) ---
+imp_mean_mat <- Reduce("+", imp_rf_list) / length(imp_rf_list)
+imp_df <- imp_mean_mat %>%
   as.data.frame() %>%
   rownames_to_column("Variable") %>%
   rename(Importancia = MeanDecreaseGini) %>%
@@ -906,27 +976,19 @@ p_imp <- ggplot(imp_df,
   geom_col(fill = col_accent, alpha = 0.85) +
   coord_flip() +
   labs(
-    title    = "Importancia de variables — Random Forest (entrenado en dataset completo)",
-    subtitle = "Top 20 variables por Mean Decrease Gini",
+    title    = "Importancia de variables — Random Forest (media sobre folds de entrenamiento)",
+    subtitle = "Top 20 variables por Mean Decrease Gini medio sobre 25 iteraciones de repeated CV",
     x        = NULL,
-    y        = "Mean Decrease Gini"
+    y        = "Mean Decrease Gini (media)"
   ) +
-  theme_minimal(base_size = 10)
+  theme_minimal(base_size = 9)
 
-gridExtra::grid.arrange(p_coef, p_imp, ncol = 1, heights = c(1.2, 1))
+p_final_coef <- p_coef / p_imp + plot_layout(heights = c(1.4, 1))
+print(p_final_coef)
+ggsave(file.path(FIG_DIR, "plot-coeficientes.png"), plot = p_final_coef, width = 10, height = 12, dpi = 150)
 ```
 
-Los coeficientes del Elastic Net final (alpha = `r alpha_final`,
-n = `r nrow(dataset_integrado)`) muestran que las variables clínicas dominan para la clase
-Alta, con estadio T y estado ganglionar a la cabeza. Entre las rutas GSVA, las tres
-significativas del Script 03 aparecen con coeficientes negativos para Alta; las rutas de
-respuesta estrogénica y el metabolismo de ácidos biliares tienen menos actividad en los
-tumores más agresivos, y el modelo lo recoge. La importancia RF añade una capa que el
-Elastic Net no puede ver donde OXIDATIVE_PHOSPHORYLATION y MYC_TARGETS aparecen con importancia
-alta, probablemente capturando interacciones no lineales entre rutas que un modelo lineal
-pierde. **Estos modelos están entrenados en todo el dataset
-(n = `r nrow(dataset_integrado)`) y se presentan solo para interpretación, el AUC
-reportado viene del repeated CV.**
+La Figura 5 muestra los coeficientes del Elastic Net a lo largo de las 25 iteraciones de repeated CV, no solo del modelo final. Las barras de error (± 1 DE entre folds) permiten ver qué variables tienen una dirección consistente entre iteraciones y cuáles fluctúan. Las variables clínicas —estadio T y estado ganglionar— aparecen con coeficientes positivos estables para Alta en prácticamente todas las iteraciones, lo que indica que son predictores robustos con poca variabilidad entre particiones. Entre las rutas GSVA, las tres significativas del Script 03 aparecen con coeficientes negativos para Alta con barras que no cruzan el cero: la señal es consistente aunque débil. La importancia RF (panel inferior) refleja la media del Mean Decrease Gini a lo largo de las 25 iteraciones de entrenamiento, no un modelo entrenado sobre el dataset completo, lo que permite estimar la variabilidad de las importancias entre particiones. OXIDATIVE_PHOSPHORYLATION y MYC_TARGETS emergen como variables relevantes en ambos métodos, probablemente porque el Random Forest captura interacciones no lineales que el modelo lineal no recoge. El AUC reportado en la Tabla 3 procede del repeated CV; la Figura 5 es exclusivamente para interpretación.
 
 ```{r shap-values, echo=TRUE, cache=TRUE, fig.width=10, fig.height=7, fig.cap="**Figura 6.** Valores Shapley para el modelo Random Forest (modelo final, entrenado en dataset completo). Cada punto representa una muestra. La posición en el eje X indica la magnitud y dirección de la contribución de cada variable a la predicción de esa clase — valores positivos empujan la predicción hacia esa clase, negativos la alejan. El color indica el valor de la variable (rojo = alto, azul = bajo). Las variables se ordenan de mayor a menor importancia Shapley media. IMPORTANTE: calculado sobre el modelo final entrenado en todo el dataset, solo para interpretación."}
 
@@ -1037,9 +1099,10 @@ ggplot(shap_all, aes(x = SHAP, y = Variable, color = Valor_variable)) +
     legend.position = "right",
     strip.text      = element_text(face = "bold")
   )
+ggsave(file.path(FIG_DIR, "shap-values.png"), plot = last_plot(), width = 10, height = 7, dpi = 150)
 ```
 
-## 7.3 Valor incremental de la integración metabólica
+## Valor incremental de la integración metabólica
 
 ```{r incremento}
 delta_gsva_clinico      <- mean(auc_gsva)      - mean(auc_clinico)
@@ -1084,7 +1147,7 @@ La integración metabólica aporta una mejora `r ifelse(delta_integrado_clinico 
 
 ---
 
-# 8. Guardar outputs {#guardar}
+# Guardar outputs {#guardar}
 
 ```{r save, echo=TRUE}
 dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
@@ -1111,8 +1174,8 @@ write_csv(
   "results/tables/auc_por_fold.csv"
 )
 
-# Guardar coeficientes del modelo final (solo interpretacion)
-write_csv(coef_df, "results/tables/coeficientes_elastic_net.csv")
+# Guardar coeficientes por fold (media y DE entre iteraciones de CV)
+write_csv(coef_folds_df, "results/tables/coeficientes_elastic_net.csv")
 
 # Guardar importancia de variables RF
 write_csv(imp_df,  "results/tables/importancia_rf.csv")
@@ -1124,7 +1187,7 @@ saveRDS(rf_fit_final, "data/processed/rf_fit_final.rds")
 
 ---
 
-# 9. Resumen ejecutivo {#resumen}
+# Resumen ejecutivo {#resumen}
 
 ```{r resumen}
 data.frame(

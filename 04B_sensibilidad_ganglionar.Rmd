@@ -45,6 +45,9 @@ library(knitr)
 library(kableExtra)
 library(gridExtra)
 
+FIG_DIR <- "../TFM_PEC4/figuras"
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
 col_primary    <- "#2E75B6"
 col_accent     <- "#E8534A"
 col_intermedio <- "#F39C12"
@@ -52,6 +55,17 @@ col_integrado  <- "#27AE60"
 col_b          <- "#8E44AD"  # color exclusivo para Dataset B
 
 set.seed(1229)
+
+# AUC multiclase como promedio de AUC uno-contra-todos (misma métrica que 04_modelado.Rmd).
+auc_ova <- function(y_true, probs_mat) {
+  classes <- levels(y_true)
+  aucs <- sapply(classes, function(cls) {
+    y_bin <- as.integer(y_true == cls)
+    if (length(unique(y_bin)) < 2) return(NA_real_)
+    as.numeric(pROC::auc(pROC::roc(y_bin, probs_mat[, cls], quiet = TRUE)))
+  })
+  mean(aucs, na.rm = TRUE)
+}
 ```
 
 ---
@@ -84,7 +98,7 @@ muestras en el Script 03), pero el subconjunto analizable varía.
 
 ```{r carga, include=FALSE}
 gsva_matrix    <- readRDS("data/processed/gsva_matrix.rds")
-clinical_final <- readRDS("data/processed/clinical_final.rds")
+clinical_final <- readRDS("data/processed/clinical_preprocessed.rds")
 
 stopifnot(ncol(gsva_matrix) == nrow(clinical_final))
 ```
@@ -263,6 +277,7 @@ Para evitar duplicar código, se define una función que corre el pipeline compl
 de folds.
 
 ```{r funcion-modelado, echo=TRUE}
+set.seed(1229)
 run_models <- function(dataset, folds, y_all, vars_clinicas) {
 
   alpha_grid <- c(0, 0.25, 0.5, 0.75, 1.0)
@@ -327,7 +342,7 @@ run_models <- function(dataset, folds, y_all, vars_clinicas) {
     p_clin <- predict(fit_clin, newx = X_clin[idx_test, ],
                       s = "lambda.min", type = "response")[, , 1]
     probs_clin_list[[i]] <- p_clin
-    auc_clin[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_clin)$auc)
+    auc_clin[i] <- auc_ova(y_all[idx_test], p_clin)
 
     # --- Modelo GSVA ---
     set.seed(1229)
@@ -341,7 +356,7 @@ run_models <- function(dataset, folds, y_all, vars_clinicas) {
     p_gsva <- predict(fit_gsva, newx = X_gsva[idx_test, ],
                       s = "lambda.min", type = "response")[, , 1]
     probs_gsva_list[[i]] <- p_gsva
-    auc_gsva[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_gsva)$auc)
+    auc_gsva[i] <- auc_ova(y_all[idx_test], p_gsva)
 
     # --- Modelo integrado Elastic Net ---
     set.seed(1229)
@@ -355,7 +370,7 @@ run_models <- function(dataset, folds, y_all, vars_clinicas) {
     p_en <- predict(fit_en, newx = X_int[idx_test, ],
                     s = "lambda.min", type = "response")[, , 1]
     probs_en_list[[i]] <- p_en
-    auc_en[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_en)$auc)
+    auc_en[i] <- auc_ova(y_all[idx_test], p_en)
 
     # --- Modelo integrado Random Forest ---
     set.seed(1229)
@@ -364,7 +379,7 @@ run_models <- function(dataset, folds, y_all, vars_clinicas) {
     )
     p_rf <- predict(fit_rf, newdata = X_int[idx_test, ], type = "prob")
     probs_rf_list[[i]] <- p_rf
-    auc_rf[i] <- as.numeric(multiclass.roc(y_all[idx_test], p_rf)$auc)
+    auc_rf[i] <- auc_ova(y_all[idx_test], p_rf)
   }
 
   list(
@@ -392,7 +407,8 @@ run_models <- function(dataset, folds, y_all, vars_clinicas) {
 
 # 5. Ejecución — Dataset A {#resultados-a}
 
-```{r modelos-A, echo=TRUE, cache=TRUE}
+```{r modelos-A-auc-ova, echo=TRUE, cache=TRUE}
+set.seed(1229)
 res_A <- run_models(
   dataset      = dataset_A,
   folds        = folds_A,
@@ -417,7 +433,7 @@ cat("Integrado (RF)    — AUC:", round(mean(res_A$auc_rf),   3),
 
 # 6. Ejecución — Dataset B {#resultados-b}
 
-```{r modelos-B, echo=TRUE, cache=TRUE}
+```{r modelos-B-auc-ova, echo=TRUE, cache=TRUE}
 res_B <- run_models(
   dataset       = dataset_B,
   folds         = folds_B,
@@ -555,6 +571,7 @@ ggplot(df_plot, aes(x = Modelo, y = AUC, color = Dataset)) +
   ) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom")
+ggsave(file.path(FIG_DIR, "sensibilidad-comparacion.png"), plot = last_plot(), width = 11, height = 6, dpi = 150)
 ```
 
 ## 7.4 Variabilidad entre folds
@@ -590,6 +607,7 @@ data.frame(
   ) +
   theme_minimal(base_size = 11) +
   theme(legend.position = "bottom")
+ggsave(file.path(FIG_DIR, "sensibilidad-variabilidad.png"), plot = last_plot(), width = 10, height = 5, dpi = 150)
 ```
 
 ---

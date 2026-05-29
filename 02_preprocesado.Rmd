@@ -38,10 +38,13 @@ library(dplyr)
 library(tidyr)
 library(ggplot2)
 library(ggrepel)
-library(gridExtra)
+library(patchwork)
 library(readr)
 library(knitr)
 library(kableExtra)
+
+FIG_DIR <- "../TFM_PEC4/figuras"
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
 
 col_primary    <- "#2E75B6"
 col_accent     <- "#E8534A"
@@ -69,17 +72,39 @@ El preprocesado de datos RNA-seq comprende tres etapas secuenciales:
 
 ---
 
-# 1. Carga de datos {#carga}
+# Carga de datos {#carga}
 
 ```{r carga, include=FALSE}
 se_final       <- readRDS("data/processed/se_final.rds")
 clinical_final <- readRDS("data/processed/clinical_final.rds")
 
+# Extraer barcodes de 12 caracteres desde se_final
+barcodes_se <- substr(colData(se_final)$bcr_patient_barcode, 1, 12)
+
+# Alinear clinical_final al orden exacto de se_final:
+# 1. Conservar solo muestras presentes en ambos
+# 2. Reordenar clinical_final según el orden de se_final
+idx_match <- match(barcodes_se, clinical_final$bcr_patient_barcode)
+
+if (any(is.na(idx_match))) {
+  # Hay barcodes en se_final sin correspondencia en clinical_final
+  # Conservar solo los que tienen match
+  keep      <- !is.na(idx_match)
+  se_final  <- se_final[, keep]
+  barcodes_se <- barcodes_se[keep]
+  idx_match <- idx_match[keep]
+}
+
+clinical_final <- clinical_final[idx_match, , drop = FALSE]
+rownames(clinical_final) <- NULL
+
+# Guardar backup limpio para re-ejecuciones futuras
+saveRDS(clinical_final, "data/processed/clinical_raw.rds")
+
 stopifnot(
   inherits(se_final, "SummarizedExperiment"),
   nrow(clinical_final) == ncol(se_final),
-  all(substr(colData(se_final)$bcr_patient_barcode, 1, 12) ==
-      clinical_final$bcr_patient_barcode)
+  all(barcodes_se == clinical_final$bcr_patient_barcode)
 )
 ```
 
@@ -99,11 +124,11 @@ data.frame(
 
 ---
 
-# 2. Filtrado de genes de baja expresión {#filtrado}
+# Filtrado de genes de baja expresión {#filtrado}
 
-## 2.1 Criterio de filtrado
+## Criterio de filtrado
 
-Los datos RNA-seq crudos contienen genes con conteos muy bajos o nulos en la mayoría de muestras que no aportan información biológica útil pero incrementan el ruido estadístico y el coste computacional. Se aplica el criterio descrito por Chen, Lun y Smyth (2016): **al menos 10 conteos en al menos el 20% de las muestras**.
+Los datos RNA-seq crudos contienen genes con conteos muy bajos o nulos en la mayoría de muestras que no aportan información biológica útil pero incrementan el ruido estadístico y el coste computacional. Se aplica el criterio descrito por Chen, Lun y Smyth (2016); **al menos 10 conteos en al menos el 20% de las muestras**.
 
 ```{r filtrado, echo=TRUE}
 counts_raw   <- assay(se_final, "unstranded")
@@ -129,7 +154,7 @@ data.frame(
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
 
-## 2.2 Distribución de conteos por gen
+## Distribución de conteos por gen
 
 ```{r filtrado-plot, fig.cap="**Figura 1.** Distribución de la suma de conteos por gen (escala log10). En gris, los genes eliminados por el filtro de baja expresión; en azul, los genes mantenidos para el análisis. La barra en x = 0 corresponde a genes con conteos nulos o casi nulos en toda la cohorte, lo cual es esperado en datos de RNA-seq de tejido tumoral."}
 data.frame(total_gene = rowSums(counts_raw), mantenidos = genes_ok) %>%
@@ -141,19 +166,20 @@ data.frame(total_gene = rowSums(counts_raw), mantenidos = genes_ok) %>%
        x = "log10(Suma de conteos + 1)", y = "Número de genes", fill = NULL) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom")
+ggsave(file.path(FIG_DIR, "pca-filtrado.png"), plot = last_plot(), width = 8, height = 5, dpi = 150)
 ```
 
 Tras el filtrado se retienen **`r nrow(se_filtered)`** de los `r nrow(se_final)` genes originales (`r round(mean(genes_ok)*100,1)`%). Los `r sum(!genes_ok)` genes eliminados presentaban conteos insuficientes para ser considerados expresados de forma confiable en esta cohorte.
 
 ---
 
-# 3. Normalización VST {#normalizacion}
+# Normalización VST {#normalizacion}
 
-## 3.1 Fundamento
+## Fundamento
 
 Los conteos crudos de RNA-seq presentan varianza heterocedástica — los genes con alta expresión muestran mayor varianza absoluta — y no son directamente comparables entre muestras con distinta profundidad de secuenciación. La **Transformación de Varianza Estabilizada** (VST) implementada en DESeq2 (Love, Huber y Anders, 2014) corrige ambos problemas simultáneamente, produciendo valores en escala logarítmica aproximada con varianza homogénea en todo el rango de expresión. Se utiliza el parámetro `blind = TRUE`, que recalcula las dispersiones sin utilizar información sobre los grupos experimentales, lo cual es el procedimiento recomendado para análisis de control de calidad y exploratorios.
 
-## 3.2 Aplicación
+## Aplicación
 
 ```{r vst, echo=TRUE}
 dds        <- DESeqDataSet(se_filtered, design = ~1)
@@ -163,7 +189,7 @@ vst_matrix <- assay(vst_obj)
 
 La matriz VST resultante contiene **`r nrow(vst_matrix)` genes** y **`r ncol(vst_matrix)` muestras**, con valores en el rango `r round(min(vst_matrix),2)`–`r round(max(vst_matrix),2)`.
 
-## 3.3 Verificación de la normalización
+## Verificación de la normalización
 
 ```{r vst-verificacion, fig.cap="**Figura 2.** Distribución de expresión por muestra antes (izquierda) y después (derecha) de la normalización VST, sobre una selección aleatoria de 50 muestras. El patrón bimodal refleja dos poblaciones de genes: los de expresión baja (pico izquierdo) y los de expresión moderada a alta (pico derecho). Tras la VST, las curvas de las 50 muestras se superponen con mayor fidelidad, lo que indica que las diferencias técnicas de profundidad de secuenciación han sido corregidas."}
 set.seed(1229)
@@ -190,19 +216,20 @@ rbind(antes, despues) %>%
        x = "Valor de expresión", y = "Densidad") +
   theme_minimal(base_size = 12) +
   theme(strip.text = element_text(face = "bold"))
+ggsave(file.path(FIG_DIR, "pca-normalizacion-vst.png"), plot = last_plot(), width = 8, height = 5, dpi = 150)
 ```
 
 La normalización VST fue exitosa. Las distribuciones de las 50 muestras son sustancialmente más homogéneas tras la transformación, lo que confirma que el sesgo técnico de profundidad de secuenciación ha sido corregido. La estructura bimodal se conserva en ambos paneles, lo cual es esperado: la VST no altera la biología subyacente, únicamente estabiliza la varianza técnica.
 
 ---
 
-# 4. Análisis de Componentes Principales (PCA) {#pca}
+# Análisis de Componentes Principales (PCA) {#pca}
 
-## 4.1 Fundamento
+## Fundamento
 
 El PCA proyecta los datos de alta dimensión en un espacio reducido de componentes principales que capturan la mayor parte de la varianza. En el contexto de este TFM, el PCA permite detectar outliers, identificar posibles efectos batch y evaluar si el endpoint de agresividad genera separación biológica en los datos transcriptómicos. Se utilizan los **500 genes con mayor varianza** entre muestras, criterio estándar en análisis exploratorios de RNA-seq.
 
-## 4.2 Cálculo
+## Cálculo
 
 ```{r pca, echo=TRUE}
 set.seed(1229)
@@ -211,10 +238,9 @@ top_genes <- order(var_genes, decreasing = TRUE)[1:500]
 pca_res   <- prcomp(t(vst_matrix[top_genes, ]), scale. = FALSE)
 var_exp   <- round(summary(pca_res)$importance[2, 1:10] * 100, 1)
 
-# Variables tecnicas extraidas del barcode TCGA
-# Caracteres 6-7:   Tissue Source Site (TSS) — centro hospitalario de origen
-# Caracteres 22-25: Plate ID — placa de procesamiento en laboratorio
-barcodes_full <- colData(se_filtered)$bcr_patient_barcode
+# Extraer TSS desde clinical_final (12 chars, p.ej. "TCGA-EJ-A65F")
+# posiciones 6-7 = código de 2 letras del Tissue Source Site
+tss_codes <- substr(clinical_final$bcr_patient_barcode, 6, 7)
 
 pca_df <- data.frame(
   PC1         = pca_res$x[, 1],
@@ -224,55 +250,60 @@ pca_df <- data.frame(
   gleason     = clinical_final$gleason_total,
   t_stage     = clinical_final$t_stage_simple,
   barcode     = clinical_final$bcr_patient_barcode,
-  tss         = substr(barcodes_full, 6, 7),
-  plate       = substr(barcodes_full, 22, 25)
+  tss         = tss_codes,
+  stringsAsFactors = FALSE
 )
 ```
 
-## 4.3 PCA coloreado por variables técnicas
+## PCA coloreado por variables técnicas y biológicas
 
-El PCA coloreado por agresividad evalúa la señal biológica de interés. Sin embargo, es igualmente importante verificar que la estructura del PCA no esté dominada por **variables técnicas** como el centro de origen de la muestra (Tissue Source Site, TSS) o la placa de procesamiento en laboratorio. Si las muestras se agrupan principalmente por estas variables se indicaría un efecto batch que podría sesgar el análisis downstream.
+Antes de interpretar la posición de las muestras en el espacio PC1–PC2 en términos de agresividad, es necesario descartar que esa estructura esté dominada por variables técnicas como el centro de origen de la muestra (Tissue Source Site, TSS). Si las muestras se agrupan principalmente por TSS, existiría un efecto batch que podría sesgar el análisis downstream. Los identificadores TCGA codifican el centro de origen en los caracteres 6–7 del barcode (código de dos letras del TSS).
 
-Los identificadores TCGA codifican esta información directamente en el barcode; los caracteres 6–7 corresponden al TSS y los caracteres 22–25 al Plate ID.
+La Figura 3 muestra el PCA coloreado simultáneamente por TSS (panel izquierdo, efecto técnico) y por Gleason score (panel derecho, referencia biológica). La Figura 4 añade la variable de agresividad directamente.
 
-```{r pca-tecnico, echo=FALSE, fig.width=10, fig.height=5, fig.cap="**Figura 3.** PCA coloreado por variables técnicas. *Izquierda:* Tissue Source Site (TSS), centro hospitalario de origen. *Derecha:* Plate ID, placa de procesamiento. La ausencia de agrupación sistemática por estas variables confirma que la estructura del PCA refleja variabilidad biológica y no efectos técnicos de batch."}
+```{r pca-tecnico, echo=FALSE, fig.width=10, fig.height=5, fig.cap="**Figura 3.** PCA coloreado por variables técnicas. *Izquierda:* Tissue Source Site (TSS, código de 2 letras del centro hospitalario de origen). *Derecha:* Gleason score, como referencia de la señal biológica subyacente. La distribución homogénea de los TSS en el espacio PC1–PC2 descarta la presencia de efectos batch técnicos relevantes."}
+
+n_tss <- length(unique(pca_df$tss))
 
 p_tss <- ggplot(pca_df, aes(x = PC1, y = PC2, color = tss)) +
   geom_point(alpha = 0.65, size = 2) +
   labs(
-    title    = "PCA coloreado por TSS",
-    subtitle = "Tissue Source Site (centro de origen)",
+    title    = paste0("PCA por TSS (", n_tss, " centros)"),
+    subtitle = "Tissue Source Site",
     x        = paste0("PC1 (", var_exp[1], "%)"),
     y        = paste0("PC2 (", var_exp[2], "%)"),
     color    = "TSS"
   ) +
   theme_minimal(base_size = 11) +
-  theme(legend.position  = "right",
-        legend.text      = element_text(size = 8),
-        legend.key.size  = unit(0.4, "cm"))
+  guides(color = guide_legend(ncol = 2, override.aes = list(size = 3))) +
+  theme(legend.position  = if (n_tss > 20) "none" else "right",
+        legend.text      = element_text(size = 7),
+        legend.key.size  = unit(0.35, "cm"))
 
-p_plate <- ggplot(pca_df, aes(x = PC1, y = PC2, color = plate)) +
+p_gleason <- ggplot(pca_df, aes(x = PC1, y = PC2, color = factor(gleason))) +
   geom_point(alpha = 0.65, size = 2) +
+  scale_color_brewer(palette = "RdYlBu", direction = -1) +
   labs(
-    title    = "PCA coloreado por Plate ID",
-    subtitle = "Placa de procesamiento en laboratorio",
+    title    = "PCA por Gleason score",
+    subtitle = "Referencia biológica",
     x        = paste0("PC1 (", var_exp[1], "%)"),
     y        = paste0("PC2 (", var_exp[2], "%)"),
-    color    = "Plate"
+    color    = "Gleason"
   ) +
   theme_minimal(base_size = 11) +
   theme(legend.position  = "right",
-        legend.text      = element_text(size = 7),
-        legend.key.size  = unit(0.4, "cm"))
+        legend.text      = element_text(size = 8),
+        legend.key.size  = unit(0.35, "cm"))
 
-grid.arrange(p_tss, p_plate, ncol = 2)
+# Usar patchwork para combinar (más estable en R Markdown que grid.arrange)
+library(patchwork)
+print(p_tss + p_gleason)
+ggsave(file.path(FIG_DIR, "pca-batch.png"), plot = p_tss + p_gleason, width = 10, height = 5, dpi = 150)
 ```
 
-Los `r length(unique(pca_df$tss))` centros de origen (TSS) se distribuyen homogéneamente en el espacio PC1–PC2 sin formar agrupaciones compactas. El Plate ID es uniforme en toda la cohorte (todas las muestras comparten el mismo identificador de placa) lo que indica procesamiento estandarizado en laboratorio. En conjunto, no hay evidencia de efectos batch técnicos que justifiquen corrección adicional. La VST fue suficiente.
+Los `r n_tss` centros de origen (TSS) se distribuyen homogéneamente en el espacio PC1–PC2 sin formar agrupaciones compactas`r if(n_tss > 20) "; la leyenda se omite por claridad visual dado el número de centros" else ""`. No hay evidencia de efectos batch técnicos que justifiquen corrección adicional.
 
-## 4.4 PCA coloreado por agresividad tumoral
-
-```{r pca-plot, fig.cap="**Figura 4.** PCA de la matriz de expresión normalizada (VST). Cada punto representa una muestra tumoral, coloreada según el grupo de agresividad. La ausencia de separación nítida entre grupos en el espacio PC1–PC2 es esperada: PC1 y PC2 capturan principalmente variabilidad biológica general (heterogeneidad tumoral, pureza celular) no directamente ligada al Gleason score. La señal discriminante relevante para el modelo predictivo se explorará en el espacio de rutas metabólicas mediante GSVA."}
+```{r pca-plot, fig.cap="**Figura 4.** PCA de la matriz de expresión normalizada (VST). Cada punto representa una muestra tumoral, coloreada según el grupo de agresividad. La ausencia de separación nítida entre grupos en el espacio PC1–PC2 es esperada; PC1 y PC2 capturan principalmente variabilidad biológica general (heterogeneidad tumoral, pureza celular) no directamente ligada al Gleason score."}
 ggplot(pca_df, aes(x = PC1, y = PC2, color = agresividad)) +
   geom_point(alpha = 0.7, size = 2.5) +
   scale_color_manual(values = c("Baja" = "#5DADE2",
@@ -286,13 +317,83 @@ ggplot(pca_df, aes(x = PC1, y = PC2, color = agresividad)) +
        color = "Agresividad") +
   theme_minimal(base_size = 12) +
   theme(legend.position = "right")
+ggsave(file.path(FIG_DIR, "pca-agresividad.png"), plot = last_plot(), width = 8, height = 5, dpi = 150)
 ```
 
-PC1 (`r var_exp[1]`%) y PC2 (`r var_exp[2]`%) capturan conjuntamente el `r var_exp[1] + var_exp[2]`% de la varianza total, reflejando principalmente fuentes de variación biológica global(heterogeneidad tumoral, pureza celular, variación estromal) no directamente ligadas al Gleason score. Que los grupos de agresividad no se separen aquí no es un problema; el PCA sobre genes individuales no es el espacio donde se espera encontrar esa señal. El espacio de rutas metabólicas GSVA, con dimensionalidad reducida y variables biológicamente más estables, es donde se buscará esa separación en el Script 03.
+PC1 (`r var_exp[1]`%) y PC2 (`r var_exp[2]`%) capturan conjuntamente el `r var_exp[1] + var_exp[2]`% de la varianza total, reflejando principalmente fuentes de variación biológica global (heterogeneidad tumoral, pureza celular, variación estromal) no directamente ligadas al Gleason score. Que los grupos de agresividad no se separen aquí no es un problema; el PCA sobre genes individuales no es el espacio donde se espera encontrar esa señal. El espacio de rutas metabólicas GSVA, con dimensionalidad reducida y variables biológicamente más estables, es donde se buscará esa separación más adelante.
 
-## 4.5 Varianza explicada por componente
+## Análisis de correlación de PC1 con variables clínicas y técnicas
 
-```{r pca-scree, fig.cap="**Figura 5.** Gráfico de sedimentación (scree plot) de las primeras 10 componentes principales. La varianza explicada decrece progresivamente sin un codo pronunciado, lo que indica que la variabilidad biológica de esta cohorte está distribuida en múltiples dimensiones y no existe un único eje dominante. Este patrón es característico de datos transcriptómicos tumorales heterogéneos."}
+Para identificar qué fuente de variabilidad domina PC1, se calcula la correlación entre los scores PC1 y las variables disponibles. Las variables continuas se evalúan con la correlación de Spearman (robusta a outliers) y las categóricas mediante la prueba de Kruskal-Wallis.
+
+```{r pc1-correlacion, fig.width=10, fig.height=4, fig.cap="**Figura 4b.** Correlación de PC1 con variables clínicas y técnicas. Izquierda: distribución de PC1 por grupo de agresividad (Kruskal-Wallis). Centro: PC1 frente al estadio T. Derecha: PC1 frente al centro de origen (TSS). Este análisis permite identificar si la principal fuente de varianza transcriptómica está ligada a características tumorales o a factores técnicos."}
+
+# Kruskal-Wallis: PC1 vs agresividad
+kw_agr <- kruskal.test(PC1 ~ agresividad, data = pca_df)
+
+# Spearman: PC1 vs gleason
+sp_gl  <- cor.test(pca_df$PC1, pca_df$gleason, method = "spearman", exact = FALSE)
+
+# Kruskal-Wallis: PC1 vs TSS
+kw_tss <- kruskal.test(PC1 ~ tss, data = pca_df)
+
+# Panel 1: boxplot PC1 por agresividad
+p_agr <- ggplot(pca_df, aes(x = agresividad, y = PC1, fill = agresividad)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1) +
+  scale_fill_manual(values = c("Baja" = "#5DADE2",
+                               "Intermedia" = col_intermedio,
+                               "Alta" = col_accent)) +
+  labs(title = paste0("PC1 vs Agresividad\n(KW p = ",
+                      format(kw_agr$p.value, digits = 3), ")"),
+       x = NULL, y = "PC1") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# Panel 2: scatter PC1 vs Gleason
+p_gl <- ggplot(pca_df, aes(x = gleason, y = PC1)) +
+  geom_jitter(alpha = 0.4, width = 0.15, size = 1.5, color = col_primary) +
+  geom_smooth(method = "lm", se = TRUE, color = col_accent, linewidth = 1) +
+  labs(title = paste0("PC1 vs Gleason\n(Spearman r = ",
+                      round(sp_gl$estimate, 3),
+                      ", p = ", format(sp_gl$p.value, digits = 3), ")"),
+       x = "Gleason total", y = "PC1") +
+  theme_minimal(base_size = 11)
+
+# Panel 3: boxplot PC1 por TSS
+p_tss2 <- ggplot(pca_df, aes(x = tss, y = PC1)) +
+  geom_boxplot(fill = col_primary, alpha = 0.6, outlier.size = 0.8) +
+  labs(title = paste0("PC1 vs TSS\n(KW p = ",
+                      format(kw_tss$p.value, digits = 3), ")"),
+       x = "TSS (centro origen)", y = "PC1") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+p_pc1_corr <- p_agr + p_gl + p_tss2
+print(p_pc1_corr)
+ggsave(file.path(FIG_DIR, "pca-pc1-correlacion.png"), plot = p_pc1_corr, width = 10, height = 4, dpi = 150)
+```
+
+```{r pc1-resumen-correlacion}
+data.frame(
+  Variable    = c("Agresividad tumoral", "Gleason total", "TSS (centro origen)"),
+  Test        = c("Kruskal-Wallis", "Spearman", "Kruskal-Wallis"),
+  Estadistico = c(round(kw_agr$statistic, 3),
+                  round(sp_gl$estimate, 3),
+                  round(kw_tss$statistic, 3)),
+  `p-valor`   = c(format(kw_agr$p.value, digits = 3),
+                  format(sp_gl$p.value, digits = 3),
+                  format(kw_tss$p.value, digits = 3))
+) %>%
+  kable(caption = "**Tabla.** Asociación de PC1 con variables clínicas y técnicas.",
+        align = c("l", "l", "r", "r")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+La PC1 muestra asociación significativa con agresividad tumoral (Kruskal-Wallis p = `r format(kw_agr$p.value, digits = 3)`) y correlación positiva débil con el Gleason score (Spearman r = `r round(sp_gl$estimate, 3)`, p = `r format(sp_gl$p.value, digits = 3)`), los tumores de mayor Gleason tienden a ubicarse en valores más extremos de PC1, aunque la relación es modesta porque el Gleason acumula heterogeneidad biológica real que trasciende la varianza capturada por un único componente. En cambio, el TSS no muestra asociación con PC1 (Kruskal-Wallis p = `r format(kw_tss$p.value, digits = 3)`), lo que confirma la ausencia de efecto batch por centro de origen. El eje de mayor varianza transcriptómica refleja biología tumoral, no artefacto técnico.
+
+## Varianza explicada por componente
+
+```{r pca-scree, fig.cap="**Figura 5.** Gráfico de sedimentación (scree plot) de las primeras 10 componentes principales. La varianza explicada decrece progresivamente sin un codo pronunciado, lo que indica que la variabilidad biológica de esta cohorte está distribuida en múltiples dimensiones y no existe un único eje dominante."}
 data.frame(PC = paste0("PC", 1:10), varianza = var_exp) %>%
   mutate(PC = factor(PC, levels = PC)) %>%
   ggplot(aes(x = PC, y = varianza)) +
@@ -301,20 +402,25 @@ data.frame(PC = paste0("PC", 1:10), varianza = var_exp) %>%
   labs(title = "Varianza explicada por componente principal",
        x = "Componente principal", y = "Varianza explicada (%)") +
   theme_minimal(base_size = 12)
+ggsave(file.path(FIG_DIR, "pca-scree.png"), plot = last_plot(), width = 8, height = 5, dpi = 150)
 ```
 
-## 4.6 Detección de outliers
+## Detección de outliers
 
 ```{r outliers, echo=TRUE}
-coords   <- pca_df[, c("PC1", "PC2")]
+set.seed(1229)
+# Distancia de Mahalanobis sobre PC1:PC3 (captura más estructura que solo PC1:PC2)
+coords   <- pca_df[, c("PC1", "PC2", "PC3")]
 dist_mah <- mahalanobis(coords, colMeans(coords), cov(coords))
-pca_df$outlier <- dist_mah > qchisq(0.999, df = 2)
+# Umbral chi-cuadrado con df = 3 (3 PCs), p < 0.001
+pca_df$dist_mah <- dist_mah
+pca_df$outlier  <- dist_mah > qchisq(0.999, df = 3)
 n_outliers <- sum(pca_df$outlier)
-cat("Muestras identificadas como outlier:", n_outliers, "\n")
+cat("Muestras identificadas como outlier (Mahalanobis PC1:PC3, p < 0.001):", n_outliers, "\n")
 if (n_outliers > 0) print(pca_df$barcode[pca_df$outlier])
 ```
 
-```{r outliers-plot, fig.cap="**Figura 6.** PCA con muestras outlier resaltadas (distancia de Mahalanobis, p < 0.001). Las muestras marcadas en rojo presentan un perfil de expresión estadísticamente alejado del centroide de la cohorte y son excluidas del análisis posterior."}
+```{r outliers-plot, fig.cap="**Figura 6.** PCA con detección de outliers mediante distancia de Mahalanobis sobre PC1–PC3 (umbral chi-cuadrado p < 0.001). Los puntos en azul corresponden a muestras dentro del rango esperado. Los puntos en rojo, indicarían muestras con un perfil de expresión estadísticamente alejado del centroide de la cohorte."}
 ggplot(pca_df, aes(x = PC1, y = PC2)) +
   geom_point(aes(color = outlier), alpha = 0.7, size = 2.5) +
   scale_color_manual(values = c("FALSE" = col_primary, "TRUE" = col_accent),
@@ -327,6 +433,7 @@ ggplot(pca_df, aes(x = PC1, y = PC2)) +
        y = paste0("PC2 (", var_exp[2], "%)"),
        color = NULL) +
   theme_minimal(base_size = 12)
+ggsave(file.path(FIG_DIR, "pca-outliers.png"), plot = last_plot(), width = 8, height = 5, dpi = 150)
 ```
 
 ```{r outliers-exclusion, echo=TRUE}
@@ -342,11 +449,11 @@ if (n_outliers > 0) {
 }
 ```
 
-`r if(n_outliers == 0) "No se identificó ninguna muestra atípica. El dataset entra en la fase de GSVA con las mismas" else paste(n_outliers, "muestras fueron excluidas.")` `r ncol(vst_matrix)` muestras y `r nrow(vst_matrix)` genes.
+`r if(n_outliers == 0) paste0("No se identificó ninguna muestra atípica. El dataset entra en la fase de GSVA con las ", ncol(vst_matrix), " muestras y ", nrow(vst_matrix), " genes originales.") else paste0(n_outliers, " muestras fueron excluidas por presentar distancias de Mahalanobis superiores al umbral. El dataset final contiene ", ncol(vst_matrix), " muestras y ", nrow(vst_matrix), " genes.")`
 
 ---
 
-# 5. Verificación final {#verificacion}
+# Verificación final {#verificacion}
 
 ```{r verificacion}
 stopifnot(
@@ -374,20 +481,22 @@ data.frame(
 
 ---
 
-# 6. Guardar outputs {#guardar}
+# Guardar outputs {#guardar}
 
 ```{r save, echo=TRUE}
 colnames(vst_matrix) <- substr(colnames(vst_matrix), 1, 16)
 
 saveRDS(vst_matrix,     "data/processed/vst_matrix.rds")
 saveRDS(se_filtered,    "data/processed/se_filtered.rds")
-saveRDS(clinical_final, "data/processed/clinical_final.rds")
-write_csv(clinical_final, "data/processed/clinical_final.csv")
+# Se guarda la versión post-filtrado de outliers con nombre diferente
+# para no sobreescribir clinical_final.rds (fuente de verdad del script 01).
+saveRDS(clinical_final, "data/processed/clinical_preprocessed.rds")
+write_csv(clinical_final, "data/processed/clinical_preprocessed.csv")
 ```
 
 ---
 
-# 7. Resumen ejecutivo {#resumen}
+# Resumen ejecutivo {#resumen}
 
 ```{r resumen}
 data.frame(
